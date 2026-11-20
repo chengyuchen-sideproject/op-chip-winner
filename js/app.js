@@ -2009,6 +2009,26 @@ function checkSimAutoTpSl() {
   }
 }
 
+function mergeSimPositions(positions) {
+  if (!Array.isArray(positions)) return [];
+  const map = new Map();
+  positions.forEach(p => {
+    const key = `${p.contract || ""}|${p.strike}|${p.action}`;
+    if (!map.has(key)) {
+      map.set(key, { ...p });
+    } else {
+      const acc = map.get(key);
+      const totalLots = acc.lots + p.lots;
+      const weightedPrice = ((acc.entryPrice * acc.lots) + (p.entryPrice * p.lots)) / totalLots;
+      acc.entryPrice = Math.round(weightedPrice * 100) / 100;
+      acc.lots = totalLots;
+      acc.marginLocked = (acc.marginLocked || 0) + (p.marginLocked || 0);
+      if (!acc.symbol && p.symbol) acc.symbol = p.symbol;
+    }
+  });
+  return Array.from(map.values());
+}
+
 function loadSimState() {
   try {
     const raw = localStorage.getItem(SIM_STORAGE_KEY);
@@ -2018,7 +2038,7 @@ function loadSimState() {
         initialCapital: p.initialCapital || 500000,
         cash: typeof p.cash === "number" ? p.cash : 500000,
         realizedPnl: typeof p.realizedPnl === "number" ? p.realizedPnl : 0,
-        positions: Array.isArray(p.positions) ? p.positions : [],
+        positions: mergeSimPositions(p.positions),
         history: Array.isArray(p.history) ? p.history : []
       };
     }
@@ -2091,18 +2111,35 @@ function placeSimOrder(customStrike = null, customAction = null, customLots = nu
   }
 
   const symInfo = (CONTRACT_PRICE_CACHE[activeContract] && CONTRACT_PRICE_CACHE[activeContract][`${strike}_${cp}`]) || {};
-  SIM_STATE.positions.unshift({
-    id: String(Date.now()) + "_" + Math.floor(Math.random() * 1000),
-    contract: activeContract,
-    symbol: symInfo.symbol || "",
-    strike,
-    cp,
-    action,
-    lots,
-    entryPrice: price,
-    marginLocked: isBuyer ? 0 : (marginPerLot * lots),
-    time: new Date().toTimeString().slice(0, 8)
-  });
+  const nowTime = new Date().toTimeString().slice(0, 8);
+  const existingIdx = SIM_STATE.positions.findIndex(
+    p => p.contract === activeContract && p.strike === strike && p.action === action
+  );
+  if (existingIdx >= 0) {
+    const existing = SIM_STATE.positions[existingIdx];
+    const totalLots = existing.lots + lots;
+    const weightedPrice = ((existing.entryPrice * existing.lots) + (price * lots)) / totalLots;
+    existing.entryPrice = Math.round(weightedPrice * 100) / 100;
+    existing.lots = totalLots;
+    existing.marginLocked = (existing.marginLocked || 0) + (isBuyer ? 0 : (marginPerLot * lots));
+    existing.time = nowTime;
+    if (!existing.symbol && symInfo.symbol) existing.symbol = symInfo.symbol;
+    SIM_STATE.positions.splice(existingIdx, 1);
+    SIM_STATE.positions.unshift(existing);
+  } else {
+    SIM_STATE.positions.unshift({
+      id: String(Date.now()) + "_" + Math.floor(Math.random() * 1000),
+      contract: activeContract,
+      symbol: symInfo.symbol || "",
+      strike,
+      cp,
+      action,
+      lots,
+      entryPrice: price,
+      marginLocked: isBuyer ? 0 : (marginPerLot * lots),
+      time: nowTime
+    });
+  }
 
   saveSimState();
   TAB_DIRTY.sim = false;
@@ -2363,7 +2400,7 @@ function renderSimTab() {
                     <span class="op-badge badge-${pos.action.toLowerCase()}">${pos.action}</span>
                     <strong style="margin-left:6px;font-size:0.95rem;color:#fff">${escapeHtml(pos.contract)} ${fmtNum(pos.strike)} ${pos.cp === 'C' ? 'Call' : 'Put'} × ${pos.lots}口</strong>
                     <div style="font-size:0.75rem;color:var(--muted);margin-top:3px">
-                      進場價: <strong>${pos.entryPrice.toFixed(1)}</strong> ｜ 目前市價: <strong style="color:#fde047">${curPrice.toFixed(1)}</strong> ｜ 進場時間: ${pos.time}
+                      進場均價: <strong>${pos.entryPrice.toFixed(1)}</strong> ｜ 目前市價: <strong style="color:#fde047">${curPrice.toFixed(1)}</strong> ｜ 更新時間: ${pos.time}
                     </div>
                   </div>
                   <div style="display:flex;align-items:center;gap:10px">
