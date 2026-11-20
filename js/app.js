@@ -2241,23 +2241,30 @@ function renderSimTab() {
         </div>
       </div>
 
-      <div style="display:flex;align-items:center;flex-wrap:wrap;gap:10px;margin-top:10px;font-size:0.78rem;color:#cbd5e1">
-        <span>本次投入可用資金比例：</span>
-        ${[20, 30, 50, 80].map(pct => `
-          <button class="btn ${SIM_AUTO_CONFIG.allocBudgetPct === pct ? 'active' : ''}" style="padding:3px 9px;font-size:0.74rem" onclick="SIM_AUTO_CONFIG.allocBudgetPct=${pct};renderSimTab()">${pct}% 資金</button>
-        `).join("")}
-        <span style="margin-left:auto">自動停利/停損門檻：
-          <select class="select-input" style="padding:3px 6px;font-size:0.74rem" onchange="SIM_AUTO_CONFIG.tpPct=Number(this.value);renderSimTab()">
-            <option value="15" ${SIM_AUTO_CONFIG.tpPct===15?'selected':''}>停利 +15%</option>
-            <option value="25" ${SIM_AUTO_CONFIG.tpPct===25?'selected':''}>停利 +25%</option>
-            <option value="40" ${SIM_AUTO_CONFIG.tpPct===40?'selected':''}>停利 +40%</option>
-          </select>
-          <select class="select-input" style="padding:3px 6px;font-size:0.74rem" onchange="SIM_AUTO_CONFIG.slPct=Number(this.value);renderSimTab()">
-            <option value="15" ${SIM_AUTO_CONFIG.slPct===15?'selected':''}>停損 -15%</option>
-            <option value="20" ${SIM_AUTO_CONFIG.slPct===20?'selected':''}>停損 -20%</option>
-            <option value="30" ${SIM_AUTO_CONFIG.slPct===30?'selected':''}>停損 -30%</option>
-          </select>
-        </span>
+      <div style="display:flex;flex-wrap:wrap;gap:12px 24px;margin-top:12px;font-size:0.78rem;color:#cbd5e1">
+        <div style="display:flex;flex-direction:column;gap:6px">
+          <span style="font-weight:700;color:#e2e8f0">本次投入可用資金比例：</span>
+          <div style="display:flex;flex-wrap:wrap;gap:6px">
+            ${[20, 30, 50, 80].map(pct => `
+              <button class="btn ${SIM_AUTO_CONFIG.allocBudgetPct === pct ? 'active' : ''}" style="padding:4px 10px;font-size:0.74rem" onclick="SIM_AUTO_CONFIG.allocBudgetPct=${pct};renderSimTab()">${pct}% 資金</button>
+            `).join("")}
+          </div>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:6px">
+          <span style="font-weight:700;color:#e2e8f0">自動停利/停損門檻：</span>
+          <div style="display:flex;flex-wrap:wrap;gap:6px">
+            <select class="select-input" style="padding:4px 8px;font-size:0.74rem" onchange="SIM_AUTO_CONFIG.tpPct=Number(this.value);renderSimTab()">
+              <option value="15" ${SIM_AUTO_CONFIG.tpPct===15?'selected':''}>停利 +15%</option>
+              <option value="25" ${SIM_AUTO_CONFIG.tpPct===25?'selected':''}>停利 +25%</option>
+              <option value="40" ${SIM_AUTO_CONFIG.tpPct===40?'selected':''}>停利 +40%</option>
+            </select>
+            <select class="select-input" style="padding:4px 8px;font-size:0.74rem" onchange="SIM_AUTO_CONFIG.slPct=Number(this.value);renderSimTab()">
+              <option value="15" ${SIM_AUTO_CONFIG.slPct===15?'selected':''}>停損 -15%</option>
+              <option value="20" ${SIM_AUTO_CONFIG.slPct===20?'selected':''}>停損 -20%</option>
+              <option value="30" ${SIM_AUTO_CONFIG.slPct===30?'selected':''}>停損 -30%</option>
+            </select>
+          </div>
+        </div>
       </div>
 
       <div class="advice-grid">
