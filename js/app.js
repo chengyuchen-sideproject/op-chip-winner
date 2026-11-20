@@ -192,6 +192,37 @@ function formatTaifexTime(tStr) {
   return `${s.slice(0, 2)}:${s.slice(2, 4)}:${s.slice(4, 6)}`;
 }
 
+let IS_USER_INTERACTING = false;
+let INTERACT_TIMER = null;
+
+function isUserInteractingWithForm() {
+  if (IS_USER_INTERACTING) return true;
+  const ae = document.activeElement;
+  if (ae && (ae.tagName === "SELECT" || ae.tagName === "INPUT" || ae.tagName === "TEXTAREA")) {
+    return true;
+  }
+  const modal = document.getElementById("strikeModal");
+  if (modal && modal.style.display === "flex") return true;
+  return false;
+}
+
+document.addEventListener("focusin", (e) => {
+  if (e.target && (e.target.tagName === "SELECT" || e.target.tagName === "INPUT")) {
+    IS_USER_INTERACTING = true;
+    if (INTERACT_TIMER) clearTimeout(INTERACT_TIMER);
+  }
+});
+document.addEventListener("focusout", () => {
+  if (INTERACT_TIMER) clearTimeout(INTERACT_TIMER);
+  INTERACT_TIMER = setTimeout(() => { IS_USER_INTERACTING = false; }, 350);
+});
+document.addEventListener("change", (e) => {
+  if (e.target && e.target.tagName === "SELECT") {
+    IS_USER_INTERACTING = false;
+    if (INTERACT_TIMER) clearTimeout(INTERACT_TIMER);
+  }
+});
+
 async function fetchLiveTaifexData() {
   if (CURRENT_SESSION_ID !== "LIVE_TAIFEX") return;
   try {
@@ -316,10 +347,12 @@ async function fetchLiveTaifexData() {
 
     markAllTabsDirty();
     updateTickerBar();
-    if (CURRENT_TAB === "realtime") { renderRealtimeTab(); TAB_DIRTY.realtime = false; }
-    else if (CURRENT_TAB === "strikes") { renderStrikesTab(); TAB_DIRTY.strikes = false; }
-    else if (CURRENT_TAB === "sim") { renderSimTab(); TAB_DIRTY.sim = false; }
-    else if (CURRENT_TAB === "academy") { renderAcademyTab(); TAB_DIRTY.academy = false; }
+    if (!isUserInteractingWithForm()) {
+      if (CURRENT_TAB === "realtime") { renderRealtimeTab(); TAB_DIRTY.realtime = false; }
+      else if (CURRENT_TAB === "strikes") { renderStrikesTab(); TAB_DIRTY.strikes = false; }
+      else if (CURRENT_TAB === "sim") { renderSimTab(); TAB_DIRTY.sim = false; }
+      else if (CURRENT_TAB === "academy") { renderAcademyTab(); TAB_DIRTY.academy = false; }
+    }
   } catch (err) {
     TAIFEX_STATUS.connected = false;
     TAIFEX_STATUS.errCount = (TAIFEX_STATUS.errCount || 0) + 1;
@@ -331,7 +364,7 @@ async function fetchLiveTaifexData() {
     }
     markAllTabsDirty();
     updateTickerBar();
-    if (CURRENT_TAB === "realtime") { renderRealtimeTab(); TAB_DIRTY.realtime = false; }
+    if (!isUserInteractingWithForm() && CURRENT_TAB === "realtime") { renderRealtimeTab(); TAB_DIRTY.realtime = false; }
   }
 }
 
