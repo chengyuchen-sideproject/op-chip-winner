@@ -310,6 +310,10 @@ async function fetchLiveTaifexData() {
       REPLAY_STEP = Math.max(0, REPLAY_BARS.length - 1);
     }
 
+    if (typeof checkSimAutoTpSl === "function") {
+      checkSimAutoTpSl();
+    }
+
     markAllTabsDirty();
     updateTickerBar();
     if (CURRENT_TAB === "realtime") { renderRealtimeTab(); TAB_DIRTY.realtime = false; }
@@ -1767,6 +1771,191 @@ function drawKlineWithCostCanvas(canvasId, bars, maxIdx) {
 const SIM_STORAGE_KEY = "op_chip_winner_sim_v1";
 let SIM_STATE = loadSimState();
 let SIM_FORM = { action: "BC", strike: 0, lots: 1, whatIfSettle: 0 };
+let SIM_AUTO_CONFIG = { enabled: true, tpPct: 25, slPct: 20, allocBudgetPct: 30 };
+let SIM_LAST_AUTO_MSG = "";
+
+function buildWeeklyAllocationRecommendations() {
+  const chain = ACTIVE_CHAIN;
+  const lastBar = ACTIVE_BARS[ACTIVE_BARS.length - 1];
+  if (!chain || !chain.strikes.length || !lastBar) return [];
+
+  const atm = chain.atmStrike;
+  const cVal = lastBar.callVal;
+  const pVal = lastBar.putVal;
+  const isBull = lastBar.cpDiffVal >= 0 && cVal >= 0;
+  const isBear = lastBar.cpDiffVal < 0 || (cVal < 0 && pVal >= 0);
+
+  // Score every strike in the weekly contract for best profit probability
+  const candidates = [];
+  chain.strikes.forEach(s => {
+    const distFromAtm = s.strike - atm; // >0 above ATM, <0 below ATM
+
+    // 1. Trend Buyer Pick (BC or BP) near ATM (0 to 200 pts OTM for best Gamma/Delta leverage)
+    if (isBear && s.putPrice >= 35 && s.putPrice <= 650 && distFromAtm <= 0 && distFromAtm >= -400) {
+      const volScore = Math.min(25, Math.round(s.putVol / 80));
+      const orderScore = (s.putBid >= s.putAsk) ? 12 : 5;
+      const sweetSpot = (distFromAtm === -100 || distFromAtm === -200) ? 20 : 12;
+      const winScore = Math.min(92, 42 + volScore + orderScore + sweetSpot);
+      candidates.push({
+        strike: s.strike,
+        cp: "P",
+        action: "BP",
+        price: s.putPrice,
+        vol: s.putVol,
+        oi: s.putOi,
+        winScore,
+        role: "🔥 核心順勢買方",
+        reason: `空方主導且近價平，成交量 ${fmtNum(s.putVol)} 口流動性佳、槓桿爆發力強`
+      });
+    } else if (isBull && s.callPrice >= 35 && s.callPrice <= 650 && distFromAtm >= 0 && distFromAtm <= 400) {
+      const volScore = Math.min(25, Math.round(s.callVol / 80));
+      const orderScore = (s.callBid >= s.callAsk) ? 12 : 5;
+      const sweetSpot = (distFromAtm === 100 || distFromAtm === 200) ? 20 : 12;
+      const winScore = Math.min(92, 42 + volScore + orderScore + sweetSpot);
+      candidates.push({
+        strike: s.strike,
+        cp: "C",
+        action: "BC",
+        price: s.callPrice,
+        vol: s.callVol,
+        oi: s.callOi,
+        winScore,
+        role: "🔥 核心順勢買方",
+        reason: `多方主導且近價平，成交量 ${fmtNum(s.callVol)} 口流動性佳、上攻彈性高`
+      });
+    }
+
+    // 2. High-Winrate Seller Pick (SC above ATM / Call Wall, or SP below ATM / Put Wall)
+    if (!isBull && distFromAtm >= 300 && distFromAtm <= 900 && s.callPrice >= 20 && s.callPrice <= 280) {
+      const oiBonus = s.isCallWall ? 18 : Math.min(14, Math.round(s.callOi / 300));
+      const winScore = Math.min(94, 58 + oiBonus + (s.callChg <= 0 ? 12 : 4));
+      candidates.push({
+        strike: s.strike,
+        cp: "C",
+        action: "SC",
+        price: s.callPrice,
+        vol: s.callVol,
+        oi: s.callOi,
+        winScore,
+        role: "🛡️ 高勝率賣方收租",
+        reason: `位於上檔壓力區 (+${distFromAtm}點)，賺取時間價值流失勝率高`
+      });
+    }
+    if (!isBear && distFromAtm <= -300 && distFromAtm >= -900 && s.putPrice >= 20 && s.putPrice <= 280) {
+      const oiBonus = s.isPutWall ? 18 : Math.min(14, Math.round(s.putOi / 300));
+      const winScore = Math.min(94, 58 + oiBonus + (s.putChg <= 0 ? 12 : 4));
+      candidates.push({
+        strike: s.strike,
+        cp: "P",
+        action: "SP",
+        price: s.putPrice,
+        vol: s.putVol,
+        oi: s.putOi,
+        winScore,
+        role: "🛡️ 高勝率賣方收租",
+        reason: `位於下檔支撐區 (${distFromAtm}點)，跌破機率較低適合收權利金`
+      });
+    }
+  });
+
+  // Pick top distinct picks across roles
+  candidates.sort((a, b) => b.winScore - a.winScore);
+  const picked = [];
+  const usedKeys = new Set();
+
+  // First ensure 1 trend buyer + 1 high-winrate seller + 1 secondary pick
+  const buyerPick = candidates.find(c => c.action === "BC" || c.action === "BP");
+  const sellerPick = candidates.find(c => c.action === "SC" || c.action === "SP");
+  if (buyerPick) {
+    picked.push(buyerPick);
+    usedKeys.add(`${buyerPick.strike}_${buyerPick.action}`);
+  }
+  if (sellerPick) {
+    picked.push(sellerPick);
+    usedKeys.add(`${sellerPick.strike}_${sellerPick.action}`);
+  }
+  for (let i = 0; i < candidates.length && picked.length < 3; i++) {
+    const key = `${candidates[i].strike}_${candidates[i].action}`;
+    if (!usedKeys.has(key)) {
+      picked.push(candidates[i]);
+      usedKeys.add(key);
+    }
+  }
+
+  // Fallback if market illiquid
+  if (!picked.length && chain.strikes.length) {
+    const atmRow = chain.strikes.find(x => x.isAtm) || chain.strikes[Math.floor(chain.strikes.length / 2)];
+    picked.push({
+      strike: atmRow.strike,
+      cp: isBull ? "C" : "P",
+      action: isBull ? "BC" : "BP",
+      price: isBull ? atmRow.callPrice : atmRow.putPrice,
+      vol: isBull ? atmRow.callVol : atmRow.putVol,
+      oi: isBull ? atmRow.callOi : atmRow.putOi,
+      winScore: 76,
+      role: "⚡ 價平主力連動",
+      reason: "價平流動性最佳履約價"
+    });
+  }
+
+  // Assign percentage weights summing to 100%
+  const weightProfiles = picked.length === 3 ? [50, 30, 20] : (picked.length === 2 ? [60, 40] : [100]);
+  const deployBudget = Math.max(20000, Math.round(SIM_STATE.cash * (SIM_AUTO_CONFIG.allocBudgetPct / 100)));
+
+  return picked.map((p, idx) => {
+    const pct = weightProfiles[idx];
+    const allocNtd = Math.round(deployBudget * (pct / 100));
+    const isBuy = p.action === "BC" || p.action === "BP";
+    const costPerLot = isBuy ? Math.max(500, Math.round(p.price * 50)) : 35000;
+    const suggestedLots = Math.max(1, Math.min(5, Math.floor(allocNtd / costPerLot) || 1));
+    return {
+      ...p,
+      pct,
+      allocNtd,
+      suggestedLots
+    };
+  });
+}
+
+function executeAutoRecommendedPortfolio() {
+  const recs = buildWeeklyAllocationRecommendations();
+  if (!recs.length) {
+    alert("目前尚無足夠的週選報價進行推薦下單！");
+    return;
+  }
+  let placed = 0;
+  recs.forEach(r => {
+    const isBuy = r.action === "BC" || r.action === "BP";
+    const reqCash = isBuy ? Math.round(r.price * 50 * r.suggestedLots) : (35000 * r.suggestedLots);
+    if (SIM_STATE.cash >= reqCash) {
+      placeSimOrder(r.strike, r.action, r.suggestedLots, true);
+      placed++;
+    }
+  });
+  SIM_LAST_AUTO_MSG = `🤖 已自動依百分比配置建倉 ${placed} 檔週選部位（合約：${TAIFEX_EXPIRE_MONTH || '近週選'}）！`;
+  renderSimTab();
+}
+
+function checkSimAutoTpSl() {
+  if (!SIM_AUTO_CONFIG.enabled || !SIM_STATE.positions.length) return;
+  const toClose = [];
+  SIM_STATE.positions.forEach(pos => {
+    const { curPrice, pnlNtd } = calcPosUnrealized(pos);
+    const isBuyer = pos.action === "BC" || pos.action === "BP";
+    const baseCapital = isBuyer ? Math.max(500, Math.round(pos.entryPrice * 50 * pos.lots)) : Math.max(35000, pos.marginLocked || 35000);
+    const roiPct = (pnlNtd / baseCapital) * 100;
+    if (roiPct >= SIM_AUTO_CONFIG.tpPct) {
+      toClose.push({ id: pos.id, tag: `🎯 自動停利 (+${roiPct.toFixed(1)}%)` });
+    } else if (roiPct <= -SIM_AUTO_CONFIG.slPct) {
+      toClose.push({ id: pos.id, tag: `🛡️ 自動停損 (${roiPct.toFixed(1)}%)` });
+    }
+  });
+  if (toClose.length) {
+    toClose.forEach(item => closeSimPosition(item.id, item.tag, true));
+    SIM_LAST_AUTO_MSG = `⚡ 觸發自動風控：已自動平倉 ${toClose.length} 筆部位 (${toClose.map(x => x.tag).join("、")})`;
+    TAB_DIRTY.sim = true;
+  }
+}
 
 function loadSimState() {
   try {
@@ -1814,14 +2003,14 @@ function calcPosUnrealized(pos) {
   };
 }
 
-function placeSimOrder(customStrike = null, customAction = null, customLots = null) {
+function placeSimOrder(customStrike = null, customAction = null, customLots = null, silent = false) {
   const strike = Number(customStrike || SIM_FORM.strike || (ACTIVE_CHAIN ? ACTIVE_CHAIN.atmStrike : 35000));
   const action = customAction || SIM_FORM.action || "BC";
   const lots = Math.max(1, Number(customLots || SIM_FORM.lots || 1));
   const cp = (action === "BC" || action === "SC") ? "C" : "P";
   const price = getLiveOptionPrice(strike, cp);
   if (!price || price <= 0) {
-    alert("此履約價目前尚無有效報價，請選擇其他活躍履約價！");
+    if (!silent) alert("此履約價目前尚無有效報價，請選擇其他活躍履約價！");
     return;
   }
 
@@ -1831,7 +2020,7 @@ function placeSimOrder(customStrike = null, customAction = null, customLots = nu
   const requiredCash = isBuyer ? premiumNtd : (marginPerLot * lots);
 
   if (SIM_STATE.cash < requiredCash) {
-    alert(`可用模擬資金不足！需要 NT$${fmtNum(requiredCash)}，目前可用 NT$${fmtNum(SIM_STATE.cash)}`);
+    if (!silent) alert(`可用模擬資金不足！需要 NT$${fmtNum(requiredCash)}，目前可用 NT$${fmtNum(SIM_STATE.cash)}`);
     return;
   }
 
@@ -1856,7 +2045,7 @@ function placeSimOrder(customStrike = null, customAction = null, customLots = nu
 
   saveSimState();
   TAB_DIRTY.sim = false;
-  if (CURRENT_TAB === "sim") renderSimTab();
+  if (!silent && CURRENT_TAB === "sim") renderSimTab();
 }
 
 function quickSimOrderFromModal(strike, action) {
@@ -1867,7 +2056,7 @@ function quickSimOrderFromModal(strike, action) {
   switchView("sim");
 }
 
-function closeSimPosition(posId) {
+function closeSimPosition(posId, reasonTag = "手動平倉", silent = false) {
   const idx = SIM_STATE.positions.findIndex(p => p.id === posId);
   if (idx === -1) return;
   const pos = SIM_STATE.positions[idx];
@@ -1889,13 +2078,14 @@ function closeSimPosition(posId) {
     entryPrice: pos.entryPrice,
     exitPrice: curPrice,
     pnlNtd,
+    reasonTag,
     closeTime: new Date().toTimeString().slice(0, 8)
   });
   if (SIM_STATE.history.length > 30) SIM_STATE.history.pop();
 
   SIM_STATE.positions.splice(idx, 1);
   saveSimState();
-  renderSimTab();
+  if (!silent) renderSimTab();
 }
 
 function calcTotalExpirationPnl(settleIdx) {
@@ -1946,6 +2136,8 @@ function renderSimTab() {
   const settleMax = chain.atmStrike + 1500;
   const whatIfPnl = calcTotalExpirationPnl(SIM_FORM.whatIfSettle);
 
+  const recs = buildWeeklyAllocationRecommendations();
+
   container.innerHTML = `
     <!-- Account Summary KPIs -->
     <div class="kpi-grid">
@@ -1963,6 +2155,70 @@ function renderSimTab() {
         <div class="kpi-label"><span>✅ 已實現累計損益</span><span>${SIM_STATE.history.length} 筆平倉</span></div>
         <div class="kpi-val" style="color:${SIM_STATE.realizedPnl >= 0 ? '#f87171' : '#4ade80'}">${SIM_STATE.realizedPnl >= 0 ? '+' : ''}NT$ ${fmtNum(SIM_STATE.realizedPnl)}</div>
         <div class="kpi-sub">每點乘數 NT$50 (台指選擇權標準)</div>
+      </div>
+    </div>
+
+    ${SIM_LAST_AUTO_MSG ? `
+      <div style="background:rgba(16,185,129,0.16);border:1px solid #10b981;border-radius:10px;padding:10px 14px;margin-bottom:14px;font-size:0.83rem;color:#6ee7b7;display:flex;justify-content:space-between;align-items:center">
+        <span>${escapeHtml(SIM_LAST_AUTO_MSG)}</span>
+        <button class="btn" style="padding:2px 8px;font-size:0.72rem" onclick="SIM_LAST_AUTO_MSG='';renderSimTab()">✕</button>
+      </div>
+    ` : ''}
+
+    <!-- AI Percentage-Based Weekly Options Recommendation & Auto-Trade Panel -->
+    <div class="advice-card">
+      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">
+        <div>
+          <div style="font-size:1rem;font-weight:800;color:#fff">🤖 週選百分比購買推薦 & 自動化模擬操盤（目標合約：${escapeHtml(TAIFEX_EXPIRE_MONTH || '近週選')}）</div>
+          <div style="font-size:0.76rem;color:#cbd5e1;margin-top:2px">依即時 CP 差額、VWAP 成本與 OI 壓力支撐牆，自動篩選高勝率履約價並配置購買百分比</div>
+        </div>
+        <div class="btn-group">
+          <button class="btn ${SIM_AUTO_CONFIG.enabled ? 'btn-teal' : ''}" onclick="SIM_AUTO_CONFIG.enabled=!SIM_AUTO_CONFIG.enabled;renderSimTab()">
+            ${SIM_AUTO_CONFIG.enabled ? `⚡ 自動停利+${SIM_AUTO_CONFIG.tpPct}% / 停損-${SIM_AUTO_CONFIG.slPct}% (ON)` : '⏸️ 自動停利停損 (OFF)'}
+          </button>
+          <button class="btn btn-primary" onclick="executeAutoRecommendedPortfolio()">🚀 一鍵按推薦比例自動建倉</button>
+        </div>
+      </div>
+
+      <div style="display:flex;align-items:center;flex-wrap:wrap;gap:10px;margin-top:10px;font-size:0.78rem;color:#cbd5e1">
+        <span>本次投入可用資金比例：</span>
+        ${[20, 30, 50, 80].map(pct => `
+          <button class="btn ${SIM_AUTO_CONFIG.allocBudgetPct === pct ? 'active' : ''}" style="padding:3px 9px;font-size:0.74rem" onclick="SIM_AUTO_CONFIG.allocBudgetPct=${pct};renderSimTab()">${pct}% 資金</button>
+        `).join("")}
+        <span style="margin-left:auto">自動停利/停損門檻：
+          <select class="select-input" style="padding:3px 6px;font-size:0.74rem" onchange="SIM_AUTO_CONFIG.tpPct=Number(this.value);renderSimTab()">
+            <option value="15" ${SIM_AUTO_CONFIG.tpPct===15?'selected':''}>停利 +15%</option>
+            <option value="25" ${SIM_AUTO_CONFIG.tpPct===25?'selected':''}>停利 +25%</option>
+            <option value="40" ${SIM_AUTO_CONFIG.tpPct===40?'selected':''}>停利 +40%</option>
+          </select>
+          <select class="select-input" style="padding:3px 6px;font-size:0.74rem" onchange="SIM_AUTO_CONFIG.slPct=Number(this.value);renderSimTab()">
+            <option value="15" ${SIM_AUTO_CONFIG.slPct===15?'selected':''}>停損 -15%</option>
+            <option value="20" ${SIM_AUTO_CONFIG.slPct===20?'selected':''}>停損 -20%</option>
+            <option value="30" ${SIM_AUTO_CONFIG.slPct===30?'selected':''}>停損 -30%</option>
+          </select>
+        </span>
+      </div>
+
+      <div class="advice-grid">
+        ${recs.map(r => `
+          <div class="advice-item" style="border-color:rgba(56,189,248,0.35)">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+              <span style="font-size:0.78rem;font-weight:800;color:#fde047">${escapeHtml(r.role)}</span>
+              <span class="op-badge badge-bc" style="background:rgba(56,189,248,0.2);color:#38bdf8;border-color:#38bdf8">推薦配置 ${r.pct}%</span>
+            </div>
+            <div style="font-size:0.98rem;font-weight:800;color:#fff;margin-bottom:3px">
+              <span class="op-badge badge-${r.action.toLowerCase()}">${r.action}</span>
+              ${fmtNum(r.strike)} ${r.cp === 'C' ? 'Call' : 'Put'} @ <strong style="color:#fde047">${r.price.toFixed(1)}</strong>
+            </div>
+            <div style="font-size:0.75rem;color:#34d399;margin-bottom:4px">
+              勝率評分：<strong>${r.winScore} 分</strong> ｜ 建議買賣：<strong>${r.suggestedLots} 口</strong> (約 NT$ ${fmtNum(r.allocNtd)})
+            </div>
+            <div style="font-size:0.74rem;color:var(--muted);margin-bottom:8px">${escapeHtml(r.reason)}</div>
+            <button class="btn" style="width:100%;justify-content:center;padding:5px;font-size:0.76rem" onclick="placeSimOrder(${r.strike},'${r.action}',${r.suggestedLots})">
+              ⚡ 單筆下單 (${r.action} ${r.suggestedLots}口)
+            </button>
+          </div>
+        `).join("")}
       </div>
     </div>
 
