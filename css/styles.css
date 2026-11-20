@@ -490,6 +490,108 @@ canvas {
   }
 }
 
+/* Mobile Compact T-Quote Cards (Zero horizontal scrolling) */
+.t-mobile-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.t-m-card {
+  background: rgba(15, 23, 42, 0.88);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 10px 8px;
+  cursor: pointer;
+  transition: border-color 0.15s;
+}
+
+.t-m-card:active, .t-m-card:hover {
+  border-color: var(--sky);
+}
+
+.t-m-card.atm-card {
+  background: rgba(250, 204, 21, 0.08);
+  border-color: rgba(250, 204, 21, 0.55);
+}
+
+.t-m-card.call-wall-card {
+  border-left: 4px solid var(--call-red);
+}
+
+.t-m-card.put-wall-card {
+  border-left: 4px solid var(--put-blue);
+}
+
+.t-m-grid {
+  display: grid;
+  grid-template-columns: 1fr 94px 1fr;
+  align-items: center;
+  gap: 6px;
+}
+
+.t-m-side {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.t-m-side.call { text-align: left; align-items: flex-start; }
+.t-m-side.put  { text-align: right; align-items: flex-end; }
+
+.t-m-center {
+  text-align: center;
+  background: #131f35;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 5px 4px;
+}
+
+.t-m-bars {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  margin-top: 7px;
+  align-items: center;
+}
+
+.t-m-bar-track {
+  height: 6px;
+  background: #090e1a;
+  border-radius: 3px;
+  overflow: hidden;
+  display: flex;
+}
+
+.t-m-bar-track.call { justify-content: flex-end; }
+.t-m-bar-track.put  { justify-content: flex-start; }
+
+/* Strategy Advice Box */
+.advice-card {
+  background: linear-gradient(135deg, rgba(16, 185, 129, 0.1) 0%, rgba(30, 58, 138, 0.28) 100%);
+  border: 1px solid rgba(56, 189, 248, 0.45);
+  border-left: 5px solid #10b981;
+  border-radius: 12px;
+  padding: 14px 16px;
+  margin-bottom: 16px;
+}
+
+.advice-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.advice-item {
+  background: rgba(9, 14, 26, 0.72);
+  border: 1px solid rgba(51, 65, 85, 0.8);
+  border-radius: 9px;
+  padding: 10px 12px;
+  font-size: 0.81rem;
+  line-height: 1.5;
+}
+
 .m-nav-btn {
   background: none;
   border: none;

@@ -8,6 +8,7 @@ let CURRENT_SESSION_ID = "LIVE_TAIFEX"; // Default to LIVE TAIFEX real-time data
 let CURRENT_LINE_MODE = "cp";           // 'cp' (CP差額圖) | 'cost' (台指期多空圖) | 'major' (主散圖)
 let CURRENT_TIMEFRAME = 5;              // 1 | 5 | 15 (分鐘)
 let CURRENT_CUM_DAYS = 1;               // 1 | 3 | 5 | 20
+let STRIKE_VIEW_MODE = "auto";          // 'auto' | 'mobile' | 'desktop'
 
 // Live TAIFEX State
 let TAIFEX_MARKET_TYPE = "AUTO";        // "AUTO" | "0" (日盤) | "1" (夜盤)
@@ -722,6 +723,8 @@ function renderRealtimeTab() {
       </div>
     </div>
 
+    ${buildChipAdviceHtml(lastBar, chain)}
+
     <!-- Main 3-Mode Chip Line Chart (op-win.com core feature) -->
     <div class="panel-card">
       <div class="panel-header">
@@ -992,110 +995,253 @@ function drawOiWallChart(canvasId, chain) {
 }
 
 // ============================================================================
+// Dynamic Real-Time Chip Strategy Advice Engine
+// ============================================================================
+function buildChipAdviceHtml(lastBar, chain) {
+  if (!lastBar || !chain) return "";
+  const cp = lastBar.cpDiffVal;
+  const cVal = lastBar.callVal;
+  const pVal = lastBar.putVal;
+  const price = lastBar.close;
+  const vwap = lastBar.greenMidCost;
+  const bullCost = lastBar.redBullCost;
+  const bearCost = lastBar.blueBearCost;
+  const callWall = chain.callWallStrike;
+  const putWall = chain.putWallStrike;
+  const maxPain = chain.maxPainStrike;
+
+  let postureTitle = "";
+  let postureBadge = "";
+  let buyerAdvice = "";
+  let sellerAdvice = "";
+  let riskNote = "";
+
+  if (cVal >= 0 && pVal < 0) {
+    postureTitle = "🚀 主力強偏多（買權買進 BC ＋ 賣權賣出 SP）";
+    postureBadge = `<span class="op-badge badge-bc">多方攻擊格局</span>`;
+    buyerAdvice = `順勢偏多：指數 ${price >= vwap ? '站穩' : '若站回'}多空成本綠線 (${fmtNum(vwap)}) 且紅線維持正值，可採 <strong>BC (買進價平/價外一檔 Call)</strong> 或期指順勢做多。`;
+    sellerAdvice = `穩健收租：下檔 <strong>${fmtNum(putWall)}</strong> 具大量 Put 支撐，可於 ${fmtNum(putWall)} 下方建立 <strong>SP (賣出賣權)</strong> 或牛市看漲價差。`;
+    riskNote = `⚠️ 停損參考：若 CP 差額急縮或跌破短多成本紅線 (${fmtNum(bullCost)})，多單應減碼獲利。`;
+  } else if (cVal < 0 && pVal >= 0) {
+    postureTitle = "🐻 主力偏空防守（賣權買進 BP ＋ 買權賣出 SC）";
+    postureBadge = `<span class="op-badge badge-bp">空方主導格局</span>`;
+    buyerAdvice = `避險/偏空：目前指數 (${fmtNum(price)}) ${price <= vwap ? '壓在多空分界綠線 (' + fmtNum(vwap) + ') 之下' : '高檔承壓'}，反彈不過短空成本藍線 (${fmtNum(bearCost)}) 時，可採 <strong>BP (買進賣權)</strong> 或空單避險。`;
+    sellerAdvice = `上檔壓力：<strong>${fmtNum(callWall)}</strong> 為最大 Call 壓力天花板，適合在 ${fmtNum(callWall)} 上方佈局 <strong>SC (賣出買權)</strong> 或熊市看跌價差。`;
+    riskNote = `⚠️ 反轉警訊：下檔留意 <strong>${fmtNum(putWall)}</strong> 地板支撐；若反彈站回綠線 (${fmtNum(vwap)}) 且藍線 Put 轉負，空單須立即停利。`;
+  } else if (cVal < 0 && pVal < 0) {
+    postureTitle = "⚖️ 莊家區間雙賣收租（買權賣出 SC ＋ 賣權賣出 SP）";
+    postureBadge = `<span class="op-badge badge-sc">區間盤整收斂</span>`;
+    buyerAdvice = `買方觀望：雙邊時間價值快速流失，不建議追高買 BC 或殺低買 BP，等待突破 <strong>${fmtNum(putWall)} ~ ${fmtNum(callWall)}</strong> 區間再順勢跟進。`;
+    sellerAdvice = `賣方雙收：莊家鎖定最大痛點 <strong>${fmtNum(maxPain)}</strong> 附近，可在壓力 ${fmtNum(callWall)} 之上 SC ＋ 支撐 ${fmtNum(putWall)} 之下 SP（鐵兀鷹策略）。`;
+    riskNote = `⚠️ 風控提示：若盤中出現單邊帶量突破並導致紅/藍線翻正 (> 0)，賣方需嚴格對鎖停損。`;
+  } else {
+    postureTitle = "⚡ 多空雙買震盪（BC 與 BP 同時放大・波動率上升）";
+    postureBadge = `<span class="op-badge badge-sp">高波動變盤前夕</span>`;
+    buyerAdvice = `順勢突破：市場避險與追價情緒同步升溫，建議以 <strong>${fmtNum(vwap)} (VWAP 綠線)</strong> 為多空分界，站穩偏多、跌破偏空，嚴設停損不凹單。`;
+    sellerAdvice = `賣方減碼：雙買格局容易出現急漲急跌掃停損，賣方部位建議縮小口數或改用垂直價差鎖住最大風險。`;
+    riskNote = `⚠️ 關鍵點位：觀察指數往 ${fmtNum(callWall)} (壓力) 或 ${fmtNum(putWall)} (支撐) 哪一側率先表態。`;
+  }
+
+  return `
+    <div class="advice-card">
+      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+        <div style="font-size:0.98rem;font-weight:800;color:#fff">💡 目前籌碼實戰操作建議：${escapeHtml(postureTitle)}</div>
+        ${postureBadge}
+      </div>
+      <div class="advice-grid">
+        <div class="advice-item">
+          <div style="color:#38bdf8;font-weight:700;margin-bottom:3px">1. 買方 / 期指順勢建議</div>
+          <div style="color:#e2e8f0">${buyerAdvice}</div>
+        </div>
+        <div class="advice-item">
+          <div style="color:#fbbf24;font-weight:700;margin-bottom:3px">2. 賣方 / 區間策略建議</div>
+          <div style="color:#e2e8f0">${sellerAdvice}</div>
+        </div>
+        <div class="advice-item">
+          <div style="color:#34d399;font-weight:700;margin-bottom:3px">3. 關鍵防守點位與風控</div>
+          <div style="color:#e2e8f0">${riskNote}<br><span style="color:var(--muted);font-size:0.74rem">壓力 ${fmtNum(callWall)} ｜ 痛點 ${fmtNum(maxPain)} ｜ 支撐 ${fmtNum(putWall)}</span></div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+// ============================================================================
 // Tab 2: 選擇權籌碼 T 字報價表 & 點擊價位即時載入期交所 1 分鐘量價曲線
 // ============================================================================
 function renderStrikesTab() {
   const chain = ACTIVE_CHAIN;
+  const lastBar = ACTIVE_BARS[ACTIVE_BARS.length - 1];
   const container = document.getElementById("tab-strikes");
   const maxOi = Math.max(chain.maxCallOi, chain.maxPutOi, 1);
+  const useMobileCards = STRIKE_VIEW_MODE === "mobile" || (STRIKE_VIEW_MODE === "auto" && window.innerWidth <= 860);
+
+  const mobileListHtml = `
+    <div style="display:flex;justify-content:space-between;font-size:0.75rem;color:var(--muted);padding:0 6px 6px">
+      <span style="color:#fca5a5;font-weight:700">◀ 🔴 CALL 買權 (價格/量/主力)</span>
+      <span style="color:#fde047;font-weight:700">履約價 (點擊看曲線)</span>
+      <span style="color:#93c5fd;font-weight:700">🔵 PUT 賣權 (價格/量/主力) ▶</span>
+    </div>
+    <div class="t-mobile-list">
+      ${chain.strikes.map((s, idx) => {
+        const cVal = s.callOi > 0 ? s.callOi : s.callVol;
+        const pVal = s.putOi > 0 ? s.putOi : s.putVol;
+        const cPct = Math.min(100, Math.round((cVal / maxOi) * 100));
+        const pPct = Math.min(100, Math.round((pVal / maxOi) * 100));
+        const cardCls = [
+          "t-m-card",
+          s.isAtm ? "atm-card" : "",
+          s.isCallWall ? "call-wall-card" : "",
+          s.isPutWall ? "put-wall-card" : ""
+        ].filter(Boolean).join(" ");
+
+        let tag = "";
+        if (s.isCallWall) tag = `<div style="font-size:0.65rem;color:#fca5a5;font-weight:700">🚨壓力頂</div>`;
+        else if (s.isPutWall) tag = `<div style="font-size:0.65rem;color:#93c5fd;font-weight:700">🛡️支撐底</div>`;
+        else if (s.isAtm) tag = `<div style="font-size:0.65rem;color:#fde047;font-weight:700">⚡價平區</div>`;
+        else if (s.isMaxPain) tag = `<div style="font-size:0.65rem;color:#34d399;font-weight:700">🎯痛點</div>`;
+
+        return `
+          <div class="${cardCls}" onclick="openStrikeModal(${idx})">
+            <div class="t-m-grid">
+              <div class="t-m-side call">
+                <div>
+                  <strong style="font-size:0.95rem;color:#fff">${s.callPrice.toFixed(1)}</strong>
+                  <span class="${s.callChg >= 0 ? 'up-red' : 'dn-green'}" style="font-size:0.72rem">(${s.callChg >= 0 ? '+' : ''}${s.callChg.toFixed(1)})</span>
+                </div>
+                <div style="font-size:0.72rem;color:var(--muted)">量 ${fmtNum(s.callVol)} ｜ OI ${fmtNum(s.callOi)}</div>
+                <span class="op-badge ${s.callAction === 'BC' ? 'badge-bc' : 'badge-sc'}">${s.callAction} ${s.callAction === 'BC' ? '買買權' : '賣買權'}</span>
+              </div>
+
+              <div class="t-m-center">
+                <div style="font-size:0.94rem;font-weight:800;color:#fde047">${fmtNum(s.strike)}</div>
+                ${tag || `<div style="font-size:0.65rem;color:var(--muted)">點看曲線</div>`}
+              </div>
+
+              <div class="t-m-side put">
+                <div>
+                  <span class="${s.putChg >= 0 ? 'up-red' : 'dn-green'}" style="font-size:0.72rem">(${s.putChg >= 0 ? '+' : ''}${s.putChg.toFixed(1)})</span>
+                  <strong style="font-size:0.95rem;color:#fff">${s.putPrice.toFixed(1)}</strong>
+                </div>
+                <div style="font-size:0.72rem;color:var(--muted)">量 ${fmtNum(s.putVol)} ｜ OI ${fmtNum(s.putOi)}</div>
+                <span class="op-badge ${s.putAction === 'BP' ? 'badge-bp' : 'badge-sp'}">${s.putAction} ${s.putAction === 'BP' ? '買賣權' : '賣賣權'}</span>
+              </div>
+            </div>
+            <div class="t-m-bars">
+              <div class="t-m-bar-track call"><div class="oi-bar-call" style="width:${cPct}%"></div></div>
+              <div class="t-m-bar-track put"><div class="oi-bar-put" style="width:${pPct}%"></div></div>
+            </div>
+          </div>
+        `;
+      }).join("")}
+    </div>
+  `;
+
+  const desktopTableHtml = `
+    <div class="table-scroll">
+      <table class="t-table">
+        <thead>
+          <tr>
+            <th colspan="6" class="call-head">🔴 CALL 買權（看漲 / 賣方SC為上檔壓力天花板）</th>
+            <th class="strike-col">履約價<br>(點擊看曲線)</th>
+            <th colspan="6" class="put-head">🔵 PUT 賣權（看跌 / 賣方SP為下檔支撐地板）</th>
+          </tr>
+          <tr>
+            <th>主力判定</th>
+            <th>籌碼分佈</th>
+            <th>未平倉 (OI)</th>
+            <th>預估增減</th>
+            <th>即時成交量</th>
+            <th>最新價 (漲跌)</th>
+            <th class="strike-col">Strike</th>
+            <th>最新價 (漲跌)</th>
+            <th>即時成交量</th>
+            <th>預估增減</th>
+            <th>未平倉 (OI)</th>
+            <th>籌碼分佈</th>
+            <th>主力判定</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${chain.strikes.map((s, idx) => {
+            const cVal = s.callOi > 0 ? s.callOi : s.callVol;
+            const pVal = s.putOi > 0 ? s.putOi : s.putVol;
+            const cPct = Math.min(100, Math.round((cVal / maxOi) * 100));
+            const pPct = Math.min(100, Math.round((pVal / maxOi) * 100));
+            const rowCls = [
+              "strike-row",
+              s.isAtm ? "atm-row" : "",
+              s.isCallWall ? "call-wall-row" : "",
+              s.isPutWall ? "put-wall-row" : ""
+            ].filter(Boolean).join(" ");
+
+            let strikeTag = "";
+            if (s.isCallWall) strikeTag = `<div style="font-size:0.68rem;color:#fca5a5">🚨 最大壓力天花板</div>`;
+            else if (s.isPutWall) strikeTag = `<div style="font-size:0.68rem;color:#93c5fd">🛡️ 最大支撐地板</div>`;
+            else if (s.isAtm) strikeTag = `<div style="font-size:0.68rem;color:#fde047">⚡ 價平核心區</div>`;
+            else if (s.isMaxPain) strikeTag = `<div style="font-size:0.68rem;color:#34d399">🎯 莊家最大痛點</div>`;
+
+            return `
+              <tr class="${rowCls}" onclick="openStrikeModal(${idx})" title="點擊查看 ${s.strike} 履約價當日分時量價曲線">
+                <td><span class="op-badge ${s.callAction === 'BC' ? 'badge-bc' : 'badge-sc'}">${s.callAction === 'BC' ? 'BC 買進買權' : 'SC 賣出買權'}</span></td>
+                <td><div class="oi-bar-wrap"><div class="oi-bar-call" style="width:${cPct}%"></div></div></td>
+                <td style="font-weight:700;color:#f8fafc">${fmtNum(s.callOi)}</td>
+                <td class="${s.callOiDelta >= 0 ? 'up-red' : 'dn-green'}">${fmtSigned(s.callOiDelta)}</td>
+                <td style="color:#e2e8f0;font-weight:600">${fmtNum(s.callVol)}</td>
+                <td><strong>${s.callPrice.toFixed(1)}</strong> <span class="${s.callChg >= 0 ? 'up-red' : 'dn-green'}" style="font-size:0.74rem">(${s.callChg >= 0 ? '+' : ''}${s.callChg.toFixed(1)})</span></td>
+                <td class="strike-col">
+                  <div style="font-size:0.95rem">📈 ${fmtNum(s.strike)}</div>
+                  ${strikeTag}
+                </td>
+                <td><strong>${s.putPrice.toFixed(1)}</strong> <span class="${s.putChg >= 0 ? 'up-red' : 'dn-green'}" style="font-size:0.74rem">(${s.putChg >= 0 ? '+' : ''}${s.putChg.toFixed(1)})</span></td>
+                <td style="color:#e2e8f0;font-weight:600">${fmtNum(s.putVol)}</td>
+                <td class="${s.putOiDelta >= 0 ? 'up-red' : 'dn-green'}">${fmtSigned(s.putOiDelta)}</td>
+                <td style="font-weight:700;color:#f8fafc">${fmtNum(s.putOi)}</td>
+                <td><div class="oi-bar-wrap"><div class="oi-bar-put" style="width:${pPct}%"></div></div></td>
+                <td><span class="op-badge ${s.putAction === 'BP' ? 'badge-bp' : 'badge-sp'}">${s.putAction === 'BP' ? 'BP 買進賣權' : 'SP 賣出賣權'}</span></td>
+              </tr>
+            `;
+          }).join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
 
   container.innerHTML = `
+    ${buildChipAdviceHtml(lastBar, chain)}
+
     <div class="panel-card">
       <div class="panel-header">
         <div>
-          <h2 class="section-h2">選擇權 T 字籌碼支撐壓力佈局表（點擊任一履約價看期交所即時 1 分量價曲線）</h2>
+          <h2 class="section-h2">選擇權 T 字籌碼支撐壓力佈局表（點擊任一履約價看即時曲線）</h2>
           <div style="font-size:0.78rem;color:var(--muted);margin-top:3px">
-            💡 參照 <code>op-win.com</code>：點擊任一履約價位，系統將直接向期交所 (<code>getChartData1M</code>) 拉取該履約價買賣權當日每分鐘真實量價曲線！
+            💡 手機版自動切換為「零左右滑動 T 字卡片」；點擊任一價位即可查看期交所 1 分鐘量價曲線！
           </div>
         </div>
         <div class="btn-group">
+          <button class="btn ${useMobileCards ? 'active' : ''}" onclick="STRIKE_VIEW_MODE='mobile';renderStrikesTab()">📱 精簡手機版 (免左右滑)</button>
+          <button class="btn ${!useMobileCards ? 'active' : ''}" onclick="STRIKE_VIEW_MODE='desktop';renderStrikesTab()">💻 完整電腦表格</button>
           ${CURRENT_SESSION_ID === "LIVE_TAIFEX" && TAIFEX_AVAILABLE_MONTHS.length ? `
             <select class="select-input" onchange="TAIFEX_EXPIRE_MONTH=this.value;fetchLiveTaifexData()">
-              ${TAIFEX_AVAILABLE_MONTHS.map(m => `<option value="${m}" ${m === TAIFEX_EXPIRE_MONTH ? 'selected' : ''}>期交所合約：${m}</option>`).join("")}
+              ${TAIFEX_AVAILABLE_MONTHS.map(m => `<option value="${m}" ${m === TAIFEX_EXPIRE_MONTH ? 'selected' : ''}>合約：${m}</option>`).join("")}
             </select>
-            <button class="btn btn-primary" onclick="fetchLiveTaifexData()">🔄 立即同步期交所報價</button>
+            <button class="btn btn-primary" onclick="fetchLiveTaifexData()">🔄 同步</button>
           ` : `
-            <button class="btn ${CURRENT_CUM_DAYS === 1 ? 'active' : ''}" onclick="CURRENT_CUM_DAYS=1;refreshSessionData();renderStrikesTab()">當日籌碼 (1日)</button>
-            <button class="btn ${CURRENT_CUM_DAYS === 3 ? 'active' : ''}" onclick="CURRENT_CUM_DAYS=3;refreshSessionData();renderStrikesTab()">近 3 日波段累積</button>
-            <button class="btn ${CURRENT_CUM_DAYS === 5 ? 'active' : ''}" onclick="CURRENT_CUM_DAYS=5;refreshSessionData();renderStrikesTab()">週選波段累積 (5日)</button>
+            <button class="btn ${CURRENT_CUM_DAYS === 1 ? 'active' : ''}" onclick="CURRENT_CUM_DAYS=1;refreshSessionData();renderStrikesTab()">1日</button>
+            <button class="btn ${CURRENT_CUM_DAYS === 3 ? 'active' : ''}" onclick="CURRENT_CUM_DAYS=3;refreshSessionData();renderStrikesTab()">3日</button>
+            <button class="btn ${CURRENT_CUM_DAYS === 5 ? 'active' : ''}" onclick="CURRENT_CUM_DAYS=5;refreshSessionData();renderStrikesTab()">5日</button>
           `}
         </div>
       </div>
 
-      <div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-bottom:12px;padding:10px 14px;background:#090e1a;border-radius:10px;font-size:0.82rem">
-        <div>🔴 <strong>買權最大壓力區 (Call Wall)：</strong><span style="color:#f87171;font-weight:800">${fmtNum(chain.callWallStrike)} 點</span> (${fmtNum(chain.maxCallOi)} 口)</div>
-        <div>🎯 <strong>莊家最大痛點 (Max Pain)：</strong><span style="color:#fde047;font-weight:800">${fmtNum(chain.maxPainStrike)} 點</span></div>
-        <div>🔵 <strong>賣權最大支撐區 (Put Wall)：</strong><span style="color:#60a5fa;font-weight:800">${fmtNum(chain.putWallStrike)} 點</span> (${fmtNum(chain.maxPutOi)} 口)</div>
-        <div>📊 <strong>總量能 P/C Ratio：</strong><span style="color:#34d399;font-weight:800">${chain.calcPcRatio}%</span></div>
+      <div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:12px;padding:10px 14px;background:#090e1a;border-radius:10px;font-size:0.8rem">
+        <div>🔴 <strong>壓力天花板：</strong><span style="color:#f87171;font-weight:800">${fmtNum(chain.callWallStrike)}</span> (${fmtNum(chain.maxCallOi)}口)</div>
+        <div>🎯 <strong>最大痛點：</strong><span style="color:#fde047;font-weight:800">${fmtNum(chain.maxPainStrike)}</span></div>
+        <div>🔵 <strong>支撐地板：</strong><span style="color:#60a5fa;font-weight:800">${fmtNum(chain.putWallStrike)}</span> (${fmtNum(chain.maxPutOi)}口)</div>
+        <div>📊 <strong>P/C Ratio：</strong><span style="color:#34d399;font-weight:800">${chain.calcPcRatio}%</span></div>
       </div>
 
-      <div class="table-scroll">
-        <table class="t-table">
-          <thead>
-            <tr>
-              <th colspan="6" class="call-head">🔴 CALL 買權（看漲 / 賣方SC為上檔壓力天花板）</th>
-              <th class="strike-col">履約價<br>(點擊看曲線)</th>
-              <th colspan="6" class="put-head">🔵 PUT 賣權（看跌 / 賣方SP為下檔支撐地板）</th>
-            </tr>
-            <tr>
-              <th>主力判定</th>
-              <th>籌碼分佈</th>
-              <th>未平倉 (OI)</th>
-              <th>預估增減</th>
-              <th>即時成交量</th>
-              <th>最新價 (漲跌)</th>
-              <th class="strike-col">Strike</th>
-              <th>最新價 (漲跌)</th>
-              <th>即時成交量</th>
-              <th>預估增減</th>
-              <th>未平倉 (OI)</th>
-              <th>籌碼分佈</th>
-              <th>主力判定</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${chain.strikes.map((s, idx) => {
-              const cVal = s.callOi > 0 ? s.callOi : s.callVol;
-              const pVal = s.putOi > 0 ? s.putOi : s.putVol;
-              const cPct = Math.min(100, Math.round((cVal / maxOi) * 100));
-              const pPct = Math.min(100, Math.round((pVal / maxOi) * 100));
-              const rowCls = [
-                "strike-row",
-                s.isAtm ? "atm-row" : "",
-                s.isCallWall ? "call-wall-row" : "",
-                s.isPutWall ? "put-wall-row" : ""
-              ].filter(Boolean).join(" ");
-
-              let strikeTag = "";
-              if (s.isCallWall) strikeTag = `<div style="font-size:0.68rem;color:#fca5a5">🚨 最大壓力天花板</div>`;
-              else if (s.isPutWall) strikeTag = `<div style="font-size:0.68rem;color:#93c5fd">🛡️ 最大支撐地板</div>`;
-              else if (s.isAtm) strikeTag = `<div style="font-size:0.68rem;color:#fde047">⚡ 價平核心區</div>`;
-              else if (s.isMaxPain) strikeTag = `<div style="font-size:0.68rem;color:#34d399">🎯 莊家最大痛點</div>`;
-
-              return `
-                <tr class="${rowCls}" onclick="openStrikeModal(${idx})" title="點擊查看 ${s.strike} 履約價當日分時量價曲線">
-                  <td><span class="op-badge ${s.callAction === 'BC' ? 'badge-bc' : 'badge-sc'}">${s.callAction === 'BC' ? 'BC 買進買權' : 'SC 賣出買權'}</span></td>
-                  <td><div class="oi-bar-wrap"><div class="oi-bar-call" style="width:${cPct}%"></div></div></td>
-                  <td style="font-weight:700;color:#f8fafc">${fmtNum(s.callOi)}</td>
-                  <td class="${s.callOiDelta >= 0 ? 'up-red' : 'dn-green'}">${fmtSigned(s.callOiDelta)}</td>
-                  <td style="color:#e2e8f0;font-weight:600">${fmtNum(s.callVol)}</td>
-                  <td><strong>${s.callPrice.toFixed(1)}</strong> <span class="${s.callChg >= 0 ? 'up-red' : 'dn-green'}" style="font-size:0.74rem">(${s.callChg >= 0 ? '+' : ''}${s.callChg.toFixed(1)})</span></td>
-                  <td class="strike-col">
-                    <div style="font-size:0.95rem">📈 ${fmtNum(s.strike)}</div>
-                    ${strikeTag}
-                  </td>
-                  <td><strong>${s.putPrice.toFixed(1)}</strong> <span class="${s.putChg >= 0 ? 'up-red' : 'dn-green'}" style="font-size:0.74rem">(${s.putChg >= 0 ? '+' : ''}${s.putChg.toFixed(1)})</span></td>
-                  <td style="color:#e2e8f0;font-weight:600">${fmtNum(s.putVol)}</td>
-                  <td class="${s.putOiDelta >= 0 ? 'up-red' : 'dn-green'}">${fmtSigned(s.putOiDelta)}</td>
-                  <td style="font-weight:700;color:#f8fafc">${fmtNum(s.putOi)}</td>
-                  <td><div class="oi-bar-wrap"><div class="oi-bar-put" style="width:${pPct}%"></div></div></td>
-                  <td><span class="op-badge ${s.putAction === 'BP' ? 'badge-bp' : 'badge-sp'}">${s.putAction === 'BP' ? 'BP 買進賣權' : 'SP 賣出賣權'}</span></td>
-                </tr>
-              `;
-            }).join("")}
-          </tbody>
-        </table>
-      </div>
+      ${useMobileCards ? mobileListHtml : desktopTableHtml}
     </div>
 
     <!-- Three Major Institutional Investors Table -->
