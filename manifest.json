@@ -1,0 +1,18 @@
+{
+  "name": "OP 籌碼贏家 Pro — 台指選擇權主力籌碼與三線量化系統",
+  "short_name": "OP籌碼贏家",
+  "description": "參照 op-win.com 打造之選擇權籌碼量化看盤 APP：CP差額圖、台指期多空成本圖、主散圖、履約價量價曲線、K線復盤模擬與波段支撐壓力分析",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#0f172a",
+  "theme_color": "#2563eb",
+  "orientation": "any",
+  "icons": [
+    {
+      "src": "./icons/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
