@@ -1828,131 +1828,123 @@ function buildWeeklyAllocationRecommendations() {
 
   const atm = chain.atmStrike;
   const cVal = lastBar.callVal;
-  const pVal = lastBar.putVal;
   const isBull = lastBar.cpDiffVal >= 0 && cVal >= 0;
-  const isBear = !isBull;
+  const mainAct = isBull ? "BC" : "BP";
+  const hedgeAct = isBull ? "BP" : "BC";
 
-  // Score every strike in the weekly contract across wide dynamic premium bounds (adapts to high-VIX 35,000+ market)
-  const candidates = [];
+  // Buyer-Only Strategy (100% BC & BP, zero unlimited seller risk)
+  const coreCandidates = [];
+  const leverageCandidates = [];
+  const hedgeCandidates = [];
+
   chain.strikes.forEach(s => {
-    const distFromAtm = s.strike - atm; // >0 above ATM, <0 below ATM
-
-    // 1. Trend Buyer Pick (BP or BC): 0 to 600 pts OTM
-    if (isBear && s.putPrice >= 15 && s.putPrice <= 2200 && distFromAtm <= 0 && distFromAtm >= -700) {
-      const volScore = Math.min(28, Math.round(s.putVol / 60));
-      const orderScore = (s.putBid >= s.putAsk) ? 12 : 6;
-      const sweetSpot = (distFromAtm >= -300 && distFromAtm <= -100) ? 20 : 12;
-      const winScore = Math.min(93, 40 + volScore + orderScore + sweetSpot);
-      candidates.push({
-        strike: s.strike,
-        cp: "P",
-        action: "BP",
-        price: s.putPrice,
-        vol: s.putVol,
-        oi: s.putOi,
-        winScore,
-        role: "🔥 核心順勢買方",
-        reason: `空方主導 (${distFromAtm}點)，成交量 ${fmtNum(s.putVol)} 口流動性佳`
-      });
-    } else if (isBull && s.callPrice >= 15 && s.callPrice <= 2200 && distFromAtm >= 0 && distFromAtm <= 700) {
-      const volScore = Math.min(28, Math.round(s.callVol / 60));
-      const orderScore = (s.callBid >= s.callAsk) ? 12 : 6;
-      const sweetSpot = (distFromAtm >= 100 && distFromAtm <= 300) ? 20 : 12;
-      const winScore = Math.min(93, 40 + volScore + orderScore + sweetSpot);
-      candidates.push({
-        strike: s.strike,
-        cp: "C",
-        action: "BC",
-        price: s.callPrice,
-        vol: s.callVol,
-        oi: s.callOi,
-        winScore,
-        role: "🔥 核心順勢買方",
-        reason: `多方主導 (+${distFromAtm}點)，成交量 ${fmtNum(s.callVol)} 口流動性佳`
-      });
-    }
-
-    // 2. High-Winrate Seller Pick (SC above ATM / Call Wall, or SP below ATM / Put Wall)
-    if (distFromAtm >= 300 && distFromAtm <= 1500 && s.callPrice >= 15 && s.callPrice <= 1400) {
-      const oiBonus = s.isCallWall ? 20 : Math.min(15, Math.round(s.callOi / 250));
-      const dirBonus = isBear ? 14 : 6;
-      const winScore = Math.min(95, 52 + oiBonus + dirBonus + (s.callChg <= 0 ? 8 : 2));
-      candidates.push({
-        strike: s.strike,
-        cp: "C",
-        action: "SC",
-        price: s.callPrice,
-        vol: s.callVol,
-        oi: s.callOi,
-        winScore,
-        role: "🛡️ 高勝率賣方收租",
-        reason: `上檔壓力區 (+${distFromAtm}點 / OI ${fmtNum(s.callOi)})，收權利金勝率高`
-      });
-    }
-    if (distFromAtm <= -300 && distFromAtm >= -1500 && s.putPrice >= 15 && s.putPrice <= 1400) {
-      const oiBonus = s.isPutWall ? 20 : Math.min(15, Math.round(s.putOi / 250));
-      const dirBonus = isBull ? 14 : 6;
-      const winScore = Math.min(95, 52 + oiBonus + dirBonus + (s.putChg <= 0 ? 8 : 2));
-      candidates.push({
-        strike: s.strike,
-        cp: "P",
-        action: "SP",
-        price: s.putPrice,
-        vol: s.putVol,
-        oi: s.putOi,
-        winScore,
-        role: "🛡️ 高勝率賣方收租",
-        reason: `下檔支撐區 (${distFromAtm}點 / OI ${fmtNum(s.putOi)})，跌破機率較低`
-      });
+    const dist = s.strike - atm;
+    if (mainAct === "BP") {
+      // Core BP: ATM to -300 OTM (High Delta)
+      if (s.putPrice >= 30 && s.putPrice <= 2200 && dist <= 100 && dist >= -300 && (s.putVol > 0 || s.putOi > 0)) {
+        const volScore = Math.min(30, Math.round(s.putVol / 50));
+        const bidAskBonus = s.putBid >= s.putAsk ? 10 : 5;
+        coreCandidates.push({
+          strike: s.strike, cp: "P", action: "BP", price: s.putPrice, vol: s.putVol, oi: s.putOi,
+          winScore: Math.min(94, 52 + volScore + bidAskBonus),
+          role: "🔥 1. 核心順勢買方 (近價平)",
+          reason: `空方主導 (${dist}點)，貼近價平高 Delta、成交量 ${fmtNum(s.putVol)} 口`
+        });
+      }
+      // Leverage BP: -400 to -900 OTM (Lower premium, high Gamma leverage)
+      if (s.putPrice >= 15 && s.putPrice <= 1200 && dist <= -400 && dist >= -1000 && (s.putVol > 0 || s.putOi > 0)) {
+        const volScore = Math.min(28, Math.round(s.putVol / 40));
+        leverageCandidates.push({
+          strike: s.strike, cp: "P", action: "BP", price: s.putPrice, vol: s.putVol, oi: s.putOi,
+          winScore: Math.min(90, 48 + volScore),
+          role: "⚡ 2. 高槓桿波段買方 (價外)",
+          reason: `權利金成本較低 (${dist}點)，遇急殺時報酬率放大最快`
+        });
+      }
+      // Hedge BC: +200 to +700 OTM (Cheap reversal protection)
+      if (s.callPrice >= 15 && s.callPrice <= 900 && dist >= 200 && dist <= 800 && (s.callVol > 0 || s.callOi > 0)) {
+        const volScore = Math.min(25, Math.round(s.callVol / 40));
+        hedgeCandidates.push({
+          strike: s.strike, cp: "C", action: "BC", price: s.callPrice, vol: s.callVol, oi: s.callOi,
+          winScore: Math.min(85, 44 + volScore),
+          role: "🛡️ 3. 買方反轉保護單 (BC避險)",
+          reason: `低成本佈局防軋空反轉 (+${dist}點)，形成買方勒式保護`
+        });
+      }
+    } else {
+      // Core BC: ATM to +300 OTM
+      if (s.callPrice >= 30 && s.callPrice <= 2200 && dist >= -100 && dist <= 300 && (s.callVol > 0 || s.callOi > 0)) {
+        const volScore = Math.min(30, Math.round(s.callVol / 50));
+        const bidAskBonus = s.callBid >= s.callAsk ? 10 : 5;
+        coreCandidates.push({
+          strike: s.strike, cp: "C", action: "BC", price: s.callPrice, vol: s.callVol, oi: s.callOi,
+          winScore: Math.min(94, 52 + volScore + bidAskBonus),
+          role: "🔥 1. 核心順勢買方 (近價平)",
+          reason: `多方主導 (+${dist}點)，貼近價平高 Delta、成交量 ${fmtNum(s.callVol)} 口`
+        });
+      }
+      // Leverage BC: +400 to +1000 OTM
+      if (s.callPrice >= 15 && s.callPrice <= 1200 && dist >= 400 && dist <= 1000 && (s.callVol > 0 || s.callOi > 0)) {
+        const volScore = Math.min(28, Math.round(s.callVol / 40));
+        leverageCandidates.push({
+          strike: s.strike, cp: "C", action: "BC", price: s.callPrice, vol: s.callVol, oi: s.callOi,
+          winScore: Math.min(90, 48 + volScore),
+          role: "⚡ 2. 高槓桿波段買方 (價外)",
+          reason: `權利金成本較低 (+${dist}點)，突破上攻時報酬率放大最快`
+        });
+      }
+      // Hedge BP: -200 to -800 OTM
+      if (s.putPrice >= 15 && s.putPrice <= 900 && dist <= -200 && dist >= -800 && (s.putVol > 0 || s.putOi > 0)) {
+        const volScore = Math.min(25, Math.round(s.putVol / 40));
+        hedgeCandidates.push({
+          strike: s.strike, cp: "P", action: "BP", price: s.putPrice, vol: s.putVol, oi: s.putOi,
+          winScore: Math.min(85, 44 + volScore),
+          role: "🛡️ 3. 買方反轉保護單 (BP避險)",
+          reason: `低成本防急殺回測 (${dist}點)，形成買方勒式保護`
+        });
+      }
     }
   });
 
-  // Pick top 3 distinct picks across roles
-  candidates.sort((a, b) => b.winScore - a.winScore);
+  coreCandidates.sort((a, b) => b.winScore - a.winScore);
+  leverageCandidates.sort((a, b) => b.winScore - a.winScore);
+  hedgeCandidates.sort((a, b) => b.winScore - a.winScore);
+
   const picked = [];
   const usedKeys = new Set();
-
-  const buyerPick = candidates.find(c => c.action === "BC" || c.action === "BP");
-  const sellerPick = candidates.find(c => c.action === "SC" || c.action === "SP");
-  if (buyerPick) {
-    picked.push(buyerPick);
-    usedKeys.add(`${buyerPick.strike}_${buyerPick.action}`);
-  }
-  if (sellerPick) {
-    picked.push(sellerPick);
-    usedKeys.add(`${sellerPick.strike}_${sellerPick.action}`);
-  }
-  for (let i = 0; i < candidates.length && picked.length < 3; i++) {
-    const key = `${candidates[i].strike}_${candidates[i].action}`;
+  const pushUnique = (item) => {
+    if (!item) return;
+    const key = `${item.strike}_${item.action}`;
     if (!usedKeys.has(key)) {
-      picked.push(candidates[i]);
       usedKeys.add(key);
+      picked.push(item);
     }
-  }
+  };
 
-  // Ensure Top 3 even if market has wide spreads
+  pushUnique(coreCandidates[0]);
+  pushUnique(leverageCandidates[0]);
+  pushUnique(hedgeCandidates[0]);
+
+  // Fallback to ensure Top 3 pure BC/BP picks
   if (picked.length < 3 && chain.strikes.length) {
     const midIdx = Math.max(0, chain.strikes.findIndex(x => x.isAtm));
-    const fallbackOffsets = [0, 2, -2, 1, -1, 3, -3];
-    for (let k = 0; k < fallbackOffsets.length && picked.length < 3; k++) {
-      const row = chain.strikes[midIdx + fallbackOffsets[k]];
+    const offsets = isBull ? [0, 2, -2, 1, 3, -1] : [0, -2, 2, -1, -3, 1];
+    for (let k = 0; k < offsets.length && picked.length < 3; k++) {
+      const row = chain.strikes[midIdx + offsets[k]];
       if (!row) continue;
-      const act = isBull ? (fallbackOffsets[k] < 0 ? "SP" : "BC") : (fallbackOffsets[k] > 0 ? "SC" : "BP");
-      const cp = (act === "BC" || act === "SC") ? "C" : "P";
+      const act = (offsets[k] * (isBull ? 1 : -1) < 0) ? hedgeAct : mainAct;
+      const cp = act === "BC" ? "C" : "P";
       const price = cp === "C" ? row.callPrice : row.putPrice;
       const key = `${row.strike}_${act}`;
       if (price > 0 && !usedKeys.has(key)) {
         usedKeys.add(key);
         picked.push({
-          strike: row.strike,
-          cp,
-          action: act,
-          price,
+          strike: row.strike, cp, action: act, price,
           vol: cp === "C" ? row.callVol : row.putVol,
           oi: cp === "C" ? row.callOi : row.putOi,
-          winScore: 74 - k * 2,
-          role: (act === "BC" || act === "BP") ? "⚡ 順勢輔助部位" : "🛡️ 賣方對鎖收租",
-          reason: `價平附近活躍履約價 (成交量 ${fmtNum(cp === "C" ? row.callVol : row.putVol)} 口)`
+          winScore: 76 - k * 2,
+          role: act === mainAct ? "⚡ 順勢買方部位" : "🛡️ 買方避險保護",
+          reason: `純買方 (風險僅限權利金)，成交量 ${fmtNum(cp === "C" ? row.callVol : row.putVol)} 口`
         });
       }
     }
