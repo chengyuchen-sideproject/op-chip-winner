@@ -19,6 +19,12 @@ let TAIFEX_POLL_TIMER = null;
 let TAIFEX_STATUS = {
   connected: false,
   lastUpdate: "-",
+  lastFetchEpoch: 0,
+  transportMode: "偵測中...",
+  okCount: 0,
+  errCount: 0,
+  optionCount: 0,
+  ticksCount: 0,
   activeMarketLabel: "偵測中...",
   txfSymbol: "",
   txfPrice: 0,
@@ -124,6 +130,7 @@ async function taifexPost(endpoint, payloadObj) {
 
   // Path A1: Non-blocking Async Native Android Bridge (does not freeze UI thread!)
   if (window.TaifexNative && typeof window.TaifexNative.postJsonAsync === "function") {
+    TAIFEX_STATUS.transportMode = "📱 Android 原生直連 (TaifexNative Async)";
     return await new Promise((resolve, reject) => {
       const reqId = String(__taifexReqSeq++);
       __taifexPending[reqId] = { resolve, reject };
@@ -133,6 +140,7 @@ async function taifexPost(endpoint, payloadObj) {
 
   // Path A2: Legacy Sync Native Android Bridge fallback
   if (window.TaifexNative && typeof window.TaifexNative.postJson === "function") {
+    TAIFEX_STATUS.transportMode = "📱 Android 原生直連 (Sync)";
     const raw = window.TaifexNative.postJson(targetUrl, bodyStr);
     if (raw && !raw.startsWith("ERROR:")) {
       return JSON.parse(raw);
@@ -147,7 +155,10 @@ async function taifexPost(endpoint, payloadObj) {
         headers: { "Content-Type": "application/json;charset=UTF-8" },
         body: bodyStr
       });
-      if (resp.ok) return await resp.json();
+      if (resp.ok) {
+        TAIFEX_STATUS.transportMode = "💻 本地 Python 代理 (127.0.0.1)";
+        return await resp.json();
+      }
     } catch (e) {}
   }
 
@@ -158,10 +169,14 @@ async function taifexPost(endpoint, payloadObj) {
       headers: { "Content-Type": "application/json;charset=UTF-8" },
       body: bodyStr
     });
-    if (resp.ok) return await resp.json();
+    if (resp.ok) {
+      TAIFEX_STATUS.transportMode = "🌐 瀏覽器直接連線";
+      return await resp.json();
+    }
   } catch (e) {}
 
   // Path D: CORS Proxy fallback for GitHub Pages / Desktop browser file://
+  TAIFEX_STATUS.transportMode = "☁️ 公開 CORS 代理 (corsproxy.io)";
   const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(targetUrl)}`;
   const resp = await fetch(proxyUrl, {
     method: "POST",
@@ -224,25 +239,26 @@ async function fetchLiveTaifexData() {
     const txfRef = Number(quoteDetail.CRefPrice || activeTxfRow.CRefPrice || txfPrice);
     const txfOpen = Number(quoteDetail.COpenPrice || activeTxfRow.COpenPrice || txfPrice);
 
-    TAIFEX_STATUS = {
-      connected: true,
-      lastUpdate: formatTaifexTime(activeTxfRow.CTime || new Date().toTimeString().slice(0, 8).replace(/:/g, "")),
-      activeMarketLabel: mType === "1" ? "夜盤即時 (After-Hours)" : "日盤即時 (Regular)",
-      activeMarketType: mType,
-      txfSymbol: activeTxfRow.SymbolID,
-      txfPrice: txfPrice,
-      txfOpen: txfOpen,
-      txfHigh: Number(quoteDetail.CHighPrice || txfPrice),
-      txfLow: Number(quoteDetail.CLowPrice || txfPrice),
-      txfDiff: txfPrice - txfRef,
-      txfVol: Number(quoteDetail.CTotalVolume || activeTxfRow.CTotalVolume || 0),
-      spotPrice: spotVal,
-      bidUnit: Number(quoteDetail.CBidUnit || 0),
-      askUnit: Number(quoteDetail.CAskUnit || 0),
-      bidCount: Number(quoteDetail.CBidCount || 1),
-      askCount: Number(quoteDetail.CAskCount || 1),
-      errorMsg: ""
-    };
+    TAIFEX_STATUS.connected = true;
+    TAIFEX_STATUS.lastUpdate = formatTaifexTime(activeTxfRow.CTime || new Date().toTimeString().slice(0, 8).replace(/:/g, ""));
+    TAIFEX_STATUS.lastFetchEpoch = Date.now();
+    TAIFEX_STATUS.okCount = (TAIFEX_STATUS.okCount || 0) + 1;
+    TAIFEX_STATUS.ticksCount = rawTicks.length;
+    TAIFEX_STATUS.activeMarketLabel = mType === "1" ? "夜盤即時 (After-Hours)" : "日盤即時 (Regular)";
+    TAIFEX_STATUS.activeMarketType = mType;
+    TAIFEX_STATUS.txfSymbol = activeTxfRow.SymbolID;
+    TAIFEX_STATUS.txfPrice = txfPrice;
+    TAIFEX_STATUS.txfOpen = txfOpen;
+    TAIFEX_STATUS.txfHigh = Number(quoteDetail.CHighPrice || txfPrice);
+    TAIFEX_STATUS.txfLow = Number(quoteDetail.CLowPrice || txfPrice);
+    TAIFEX_STATUS.txfDiff = txfPrice - txfRef;
+    TAIFEX_STATUS.txfVol = Number(quoteDetail.CTotalVolume || activeTxfRow.CTotalVolume || 0);
+    TAIFEX_STATUS.spotPrice = spotVal;
+    TAIFEX_STATUS.bidUnit = Number(quoteDetail.CBidUnit || 0);
+    TAIFEX_STATUS.askUnit = Number(quoteDetail.CAskUnit || 0);
+    TAIFEX_STATUS.bidCount = Number(quoteDetail.CBidCount || 1);
+    TAIFEX_STATUS.askCount = Number(quoteDetail.CAskCount || 1);
+    TAIFEX_STATUS.errorMsg = "";
 
     PAYOFF_STRIKE = Math.round(txfPrice / 100) * 100;
 
@@ -283,6 +299,7 @@ async function fetchLiveTaifexData() {
     }
 
     // Build Live Strike Chain & Net Call/Put Option Force
+    TAIFEX_STATUS.optionCount = activeOptList.length;
     const BuiltChain = buildLiveStrikeChainFromTaifex(activeOptList, dayOiMap, txfPrice);
     ACTIVE_CHAIN = BuiltChain;
 
@@ -301,6 +318,7 @@ async function fetchLiveTaifexData() {
     else if (CURRENT_TAB === "academy") { renderAcademyTab(); TAB_DIRTY.academy = false; }
   } catch (err) {
     TAIFEX_STATUS.connected = false;
+    TAIFEX_STATUS.errCount = (TAIFEX_STATUS.errCount || 0) + 1;
     TAIFEX_STATUS.errorMsg = err.message || String(err);
     if (!ACTIVE_BARS.length) {
       const fallbackCfg = MARKET_SESSIONS[0];
@@ -587,11 +605,14 @@ function updateTickerBar() {
   const spread = Math.round(txfPrice - cfg.spotClose);
   const isBull = lastBar.cpDiffVal >= 0;
 
+  const ageSec = TAIFEX_STATUS.lastFetchEpoch ? Math.round((Date.now() - TAIFEX_STATUS.lastFetchEpoch) / 1000) : 999;
+  const isStale = ageSec > 25;
+
   const liveBadge = CURRENT_SESSION_ID === "LIVE_TAIFEX"
-    ? (TAIFEX_STATUS.connected
-        ? `<span class="op-badge badge-sc" style="background:rgba(16,185,129,0.22);color:#34d399;border-color:#10b981">🟢 期交所 MIS 即時連線 (${TAIFEX_STATUS.lastUpdate})</span>`
-        : `<span class="op-badge badge-sp">⚠️ 連線期交所中...</span>`)
-    : `<span class="op-badge badge-bp">📂 歷史回顧模式</span>`;
+    ? (TAIFEX_STATUS.connected && !isStale
+        ? `<span class="op-badge badge-sc" style="cursor:pointer;background:rgba(16,185,129,0.22);color:#34d399;border-color:#10b981" onclick="openDataHealthModal()" title="點擊查看資料健康與延遲診斷">🟢 期交所連線正常 (${TAIFEX_STATUS.lastUpdate} · ${ageSec}s前) ℹ️</span>`
+        : `<span class="op-badge badge-sp" style="cursor:pointer;background:rgba(239,68,68,0.22);color:#fca5a5;border-color:#ef4444" onclick="openDataHealthModal()" title="點擊查看連線錯誤原因">⚠️ ${TAIFEX_STATUS.errorMsg ? '連線異常 (點看原因)' : '連線期交所中...'} ℹ️</span>`)
+    : `<span class="op-badge badge-bp" style="cursor:pointer" onclick="openDataHealthModal()">📂 歷史回顧模式 ℹ️</span>`;
 
   const el = document.getElementById("tickerBarContent");
   if (!el) return;
@@ -611,6 +632,70 @@ function updateTickerBar() {
       </span>
     </div>
   `;
+}
+
+function openDataHealthModal() {
+  const modal = document.getElementById("strikeModal");
+  const body = document.getElementById("strikeModalContent");
+  const ageSec = TAIFEX_STATUS.lastFetchEpoch ? Math.round((Date.now() - TAIFEX_STATUS.lastFetchEpoch) / 1000) : "-";
+  const now = new Date();
+  const day = now.getDay(); // 0=Sun, 6=Sat
+  const hm = now.getHours() * 100 + now.getMinutes();
+  const isClosed = (day === 0) || (day === 6 && hm >= 500) || (hm > 1345 && hm < 1500) || (hm >= 500 && hm < 845);
+
+  body.innerHTML = `
+    <div class="panel-header" style="margin-bottom:12px">
+      <div>
+        <h3 style="margin:0;font-size:1.1rem;color:#38bdf8">📡 期交所資料連線健康度與限制診斷</h3>
+        <div style="font-size:0.78rem;color:var(--muted);margin-top:3px">點擊頂部狀態列隨時確認資料是否正常更新與真實性</div>
+      </div>
+      <button class="btn" onclick="document.getElementById('strikeModal').style.display='none'">關閉 ✕</button>
+    </div>
+
+    <div class="t-mobile-list">
+      <div class="t-m-card" style="cursor:default">
+        <div style="display:flex;justify-content:space-between;font-size:0.84rem">
+          <span>連線狀態：</span>
+          <strong style="color:${TAIFEX_STATUS.connected ? '#34d399' : '#f87171'}">${TAIFEX_STATUS.connected ? '🟢 正常連線中' : '🔴 連線異常 / 未連線'}</strong>
+        </div>
+        <div style="display:flex;justify-content:space-between;font-size:0.84rem;margin-top:6px">
+          <span>傳輸通道：</span>
+          <strong style="color:#fde047">${escapeHtml(TAIFEX_STATUS.transportMode)}</strong>
+        </div>
+        <div style="display:flex;justify-content:space-between;font-size:0.84rem;margin-top:6px">
+          <span>期交所最新報價時間 (CTime)：</span>
+          <strong style="color:#fff">${escapeHtml(TAIFEX_STATUS.lastUpdate)} (距今 ${ageSec} 秒)</strong>
+        </div>
+        <div style="display:flex;justify-content:space-between;font-size:0.84rem;margin-top:6px">
+          <span>目前盤別與合約：</span>
+          <strong>${escapeHtml(TAIFEX_STATUS.activeMarketLabel)} ｜ ${escapeHtml(TAIFEX_EXPIRE_MONTH || '-')}</strong>
+        </div>
+        <div style="display:flex;justify-content:space-between;font-size:0.84rem;margin-top:6px">
+          <span>已抓回筆數統計：</span>
+          <strong>成功 ${TAIFEX_STATUS.okCount} 次 / 失敗 ${TAIFEX_STATUS.errCount} 次 ｜ 1分K ${TAIFEX_STATUS.ticksCount} 根 ｜ 選擇權 ${TAIFEX_STATUS.optionCount} 檔</strong>
+        </div>
+        <div style="display:flex;justify-content:space-between;font-size:0.84rem;margin-top:6px">
+          <span>市場交易時段狀態：</span>
+          <strong style="color:${isClosed ? '#fbbf24' : '#34d399'}">${isClosed ? '⏸️ 目前為休市/盤間休息時間 (報價維持最後成交價)' : '✅ 正常開盤交易時段'}</strong>
+        </div>
+        ${TAIFEX_STATUS.errorMsg ? `<div style="margin-top:8px;color:#f87171;font-size:0.8rem">錯誤訊息：${escapeHtml(TAIFEX_STATUS.errorMsg)}</div>` : ''}
+      </div>
+
+      <div class="advice-item">
+        <div style="color:#fbbf24;font-weight:700;margin-bottom:4px">⚠️ 串接與數據限制說明</div>
+        <div style="color:#cbd5e1;font-size:0.78rem;line-height:1.6">
+          1. <strong>輪詢延遲</strong>：採用期交所公開 MIS API 每 6 秒輪詢一次（約 3~8 秒延遲），非券商付費逐筆 Tick 專線。<br>
+          2. <strong>日/夜盤 OI 差異</strong>：夜盤期間「未平倉 (OI)」固定沿用日盤收盤留倉數，盤後才會結算更新。<br>
+          3. <strong>CP 差額 / 主散推估</strong>：期交所公開 API 不含「逐筆內外盤成交明細」，故盤中 CP 差額與主散力道係以各履約價漲跌/五檔買賣掛單與 1 分 K 量價動能推估；<strong>三大法人</strong>為盤後公布之參考結構。
+        </div>
+      </div>
+    </div>
+
+    <div style="margin-top:12px;text-align:right">
+      <button class="btn btn-primary" onclick="fetchLiveTaifexData();document.getElementById('strikeModal').style.display='none'">🔄 立即手動測試重抓</button>
+    </div>
+  `;
+  modal.style.display = "flex";
 }
 
 // ============================================================================
