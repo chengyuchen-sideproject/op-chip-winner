@@ -1830,19 +1830,19 @@ function buildWeeklyAllocationRecommendations() {
   const cVal = lastBar.callVal;
   const pVal = lastBar.putVal;
   const isBull = lastBar.cpDiffVal >= 0 && cVal >= 0;
-  const isBear = lastBar.cpDiffVal < 0 || (cVal < 0 && pVal >= 0);
+  const isBear = !isBull;
 
-  // Score every strike in the weekly contract for best profit probability
+  // Score every strike in the weekly contract across wide dynamic premium bounds (adapts to high-VIX 35,000+ market)
   const candidates = [];
   chain.strikes.forEach(s => {
     const distFromAtm = s.strike - atm; // >0 above ATM, <0 below ATM
 
-    // 1. Trend Buyer Pick (BC or BP) near ATM (0 to 200 pts OTM for best Gamma/Delta leverage)
-    if (isBear && s.putPrice >= 35 && s.putPrice <= 650 && distFromAtm <= 0 && distFromAtm >= -400) {
-      const volScore = Math.min(25, Math.round(s.putVol / 80));
-      const orderScore = (s.putBid >= s.putAsk) ? 12 : 5;
-      const sweetSpot = (distFromAtm === -100 || distFromAtm === -200) ? 20 : 12;
-      const winScore = Math.min(92, 42 + volScore + orderScore + sweetSpot);
+    // 1. Trend Buyer Pick (BP or BC): 0 to 600 pts OTM
+    if (isBear && s.putPrice >= 15 && s.putPrice <= 2200 && distFromAtm <= 0 && distFromAtm >= -700) {
+      const volScore = Math.min(28, Math.round(s.putVol / 60));
+      const orderScore = (s.putBid >= s.putAsk) ? 12 : 6;
+      const sweetSpot = (distFromAtm >= -300 && distFromAtm <= -100) ? 20 : 12;
+      const winScore = Math.min(93, 40 + volScore + orderScore + sweetSpot);
       candidates.push({
         strike: s.strike,
         cp: "P",
@@ -1852,13 +1852,13 @@ function buildWeeklyAllocationRecommendations() {
         oi: s.putOi,
         winScore,
         role: "🔥 核心順勢買方",
-        reason: `空方主導且近價平，成交量 ${fmtNum(s.putVol)} 口流動性佳、槓桿爆發力強`
+        reason: `空方主導 (${distFromAtm}點)，成交量 ${fmtNum(s.putVol)} 口流動性佳`
       });
-    } else if (isBull && s.callPrice >= 35 && s.callPrice <= 650 && distFromAtm >= 0 && distFromAtm <= 400) {
-      const volScore = Math.min(25, Math.round(s.callVol / 80));
-      const orderScore = (s.callBid >= s.callAsk) ? 12 : 5;
-      const sweetSpot = (distFromAtm === 100 || distFromAtm === 200) ? 20 : 12;
-      const winScore = Math.min(92, 42 + volScore + orderScore + sweetSpot);
+    } else if (isBull && s.callPrice >= 15 && s.callPrice <= 2200 && distFromAtm >= 0 && distFromAtm <= 700) {
+      const volScore = Math.min(28, Math.round(s.callVol / 60));
+      const orderScore = (s.callBid >= s.callAsk) ? 12 : 6;
+      const sweetSpot = (distFromAtm >= 100 && distFromAtm <= 300) ? 20 : 12;
+      const winScore = Math.min(93, 40 + volScore + orderScore + sweetSpot);
       candidates.push({
         strike: s.strike,
         cp: "C",
@@ -1868,14 +1868,15 @@ function buildWeeklyAllocationRecommendations() {
         oi: s.callOi,
         winScore,
         role: "🔥 核心順勢買方",
-        reason: `多方主導且近價平，成交量 ${fmtNum(s.callVol)} 口流動性佳、上攻彈性高`
+        reason: `多方主導 (+${distFromAtm}點)，成交量 ${fmtNum(s.callVol)} 口流動性佳`
       });
     }
 
     // 2. High-Winrate Seller Pick (SC above ATM / Call Wall, or SP below ATM / Put Wall)
-    if (!isBull && distFromAtm >= 300 && distFromAtm <= 900 && s.callPrice >= 20 && s.callPrice <= 280) {
-      const oiBonus = s.isCallWall ? 18 : Math.min(14, Math.round(s.callOi / 300));
-      const winScore = Math.min(94, 58 + oiBonus + (s.callChg <= 0 ? 12 : 4));
+    if (distFromAtm >= 300 && distFromAtm <= 1500 && s.callPrice >= 15 && s.callPrice <= 1400) {
+      const oiBonus = s.isCallWall ? 20 : Math.min(15, Math.round(s.callOi / 250));
+      const dirBonus = isBear ? 14 : 6;
+      const winScore = Math.min(95, 52 + oiBonus + dirBonus + (s.callChg <= 0 ? 8 : 2));
       candidates.push({
         strike: s.strike,
         cp: "C",
@@ -1885,12 +1886,13 @@ function buildWeeklyAllocationRecommendations() {
         oi: s.callOi,
         winScore,
         role: "🛡️ 高勝率賣方收租",
-        reason: `位於上檔壓力區 (+${distFromAtm}點)，賺取時間價值流失勝率高`
+        reason: `上檔壓力區 (+${distFromAtm}點 / OI ${fmtNum(s.callOi)})，收權利金勝率高`
       });
     }
-    if (!isBear && distFromAtm <= -300 && distFromAtm >= -900 && s.putPrice >= 20 && s.putPrice <= 280) {
-      const oiBonus = s.isPutWall ? 18 : Math.min(14, Math.round(s.putOi / 300));
-      const winScore = Math.min(94, 58 + oiBonus + (s.putChg <= 0 ? 12 : 4));
+    if (distFromAtm <= -300 && distFromAtm >= -1500 && s.putPrice >= 15 && s.putPrice <= 1400) {
+      const oiBonus = s.isPutWall ? 20 : Math.min(15, Math.round(s.putOi / 250));
+      const dirBonus = isBull ? 14 : 6;
+      const winScore = Math.min(95, 52 + oiBonus + dirBonus + (s.putChg <= 0 ? 8 : 2));
       candidates.push({
         strike: s.strike,
         cp: "P",
@@ -1900,17 +1902,16 @@ function buildWeeklyAllocationRecommendations() {
         oi: s.putOi,
         winScore,
         role: "🛡️ 高勝率賣方收租",
-        reason: `位於下檔支撐區 (${distFromAtm}點)，跌破機率較低適合收權利金`
+        reason: `下檔支撐區 (${distFromAtm}點 / OI ${fmtNum(s.putOi)})，跌破機率較低`
       });
     }
   });
 
-  // Pick top distinct picks across roles
+  // Pick top 3 distinct picks across roles
   candidates.sort((a, b) => b.winScore - a.winScore);
   const picked = [];
   const usedKeys = new Set();
 
-  // First ensure 1 trend buyer + 1 high-winrate seller + 1 secondary pick
   const buyerPick = candidates.find(c => c.action === "BC" || c.action === "BP");
   const sellerPick = candidates.find(c => c.action === "SC" || c.action === "SP");
   if (buyerPick) {
@@ -1929,20 +1930,32 @@ function buildWeeklyAllocationRecommendations() {
     }
   }
 
-  // Fallback if market illiquid
-  if (!picked.length && chain.strikes.length) {
-    const atmRow = chain.strikes.find(x => x.isAtm) || chain.strikes[Math.floor(chain.strikes.length / 2)];
-    picked.push({
-      strike: atmRow.strike,
-      cp: isBull ? "C" : "P",
-      action: isBull ? "BC" : "BP",
-      price: isBull ? atmRow.callPrice : atmRow.putPrice,
-      vol: isBull ? atmRow.callVol : atmRow.putVol,
-      oi: isBull ? atmRow.callOi : atmRow.putOi,
-      winScore: 76,
-      role: "⚡ 價平主力連動",
-      reason: "價平流動性最佳履約價"
-    });
+  // Ensure Top 3 even if market has wide spreads
+  if (picked.length < 3 && chain.strikes.length) {
+    const midIdx = Math.max(0, chain.strikes.findIndex(x => x.isAtm));
+    const fallbackOffsets = [0, 2, -2, 1, -1, 3, -3];
+    for (let k = 0; k < fallbackOffsets.length && picked.length < 3; k++) {
+      const row = chain.strikes[midIdx + fallbackOffsets[k]];
+      if (!row) continue;
+      const act = isBull ? (fallbackOffsets[k] < 0 ? "SP" : "BC") : (fallbackOffsets[k] > 0 ? "SC" : "BP");
+      const cp = (act === "BC" || act === "SC") ? "C" : "P";
+      const price = cp === "C" ? row.callPrice : row.putPrice;
+      const key = `${row.strike}_${act}`;
+      if (price > 0 && !usedKeys.has(key)) {
+        usedKeys.add(key);
+        picked.push({
+          strike: row.strike,
+          cp,
+          action: act,
+          price,
+          vol: cp === "C" ? row.callVol : row.putVol,
+          oi: cp === "C" ? row.callOi : row.putOi,
+          winScore: 74 - k * 2,
+          role: (act === "BC" || act === "BP") ? "⚡ 順勢輔助部位" : "🛡️ 賣方對鎖收租",
+          reason: `價平附近活躍履約價 (成交量 ${fmtNum(cp === "C" ? row.callVol : row.putVol)} 口)`
+        });
+      }
+    }
   }
 
   // Assign percentage weights summing to 100%
