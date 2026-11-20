@@ -2242,11 +2242,11 @@ function renderSimTab() {
       </div>
 
       <div style="display:flex;flex-wrap:wrap;gap:12px 24px;margin-top:12px;font-size:0.78rem;color:#cbd5e1">
-        <div style="display:flex;flex-direction:column;gap:6px">
+        <div style="display:flex;flex-direction:column;gap:6px;width:100%;max-width:360px">
           <span style="font-weight:700;color:#e2e8f0">本次投入可用資金比例：</span>
-          <div style="display:flex;flex-wrap:wrap;gap:6px">
+          <div style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px">
             ${[20, 30, 50, 80].map(pct => `
-              <button class="btn ${SIM_AUTO_CONFIG.allocBudgetPct === pct ? 'active' : ''}" style="padding:4px 10px;font-size:0.74rem" onclick="SIM_AUTO_CONFIG.allocBudgetPct=${pct};renderSimTab()">${pct}% 資金</button>
+              <button class="btn ${SIM_AUTO_CONFIG.allocBudgetPct === pct ? 'active' : ''}" style="padding:5px 4px;font-size:0.73rem;white-space:nowrap;text-align:center" onclick="SIM_AUTO_CONFIG.allocBudgetPct=${pct};renderSimTab()">${pct}% 資金</button>
             `).join("")}
           </div>
         </div>
