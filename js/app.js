@@ -300,7 +300,7 @@ async function fetchLiveTaifexData() {
 
     // Build Live Strike Chain & Net Call/Put Option Force
     TAIFEX_STATUS.optionCount = activeOptList.length;
-    const BuiltChain = buildLiveStrikeChainFromTaifex(activeOptList, dayOiMap, txfPrice);
+    const BuiltChain = buildLiveStrikeChainFromTaifex(activeOptList, dayOiMap, txfPrice, TAIFEX_EXPIRE_MONTH);
     ACTIVE_CHAIN = BuiltChain;
 
     // Build Live Intraday 1m / 5m / 15m Bars & 3-Mode Chip Lines from TAIFEX 1M Ticks
@@ -339,9 +339,12 @@ async function fetchLiveTaifexData() {
  * Converts TAIFEX getQuoteListOption response into our structured Strike Chain,
  * calculating live BC/SC/BP/SP dominant actions, Call/Put Walls, Max Pain, and Total Call/Put Net Force.
  */
-function buildLiveStrikeChainFromTaifex(optList, dayOiMap, spotPrice) {
+const CONTRACT_PRICE_CACHE = {};
+
+function buildLiveStrikeChainFromTaifex(optList, dayOiMap, spotPrice, contractName = "") {
   const atmStrike = Math.round(spotPrice / 100) * 100;
   const strikeMap = {};
+  if (contractName) CONTRACT_PRICE_CACHE[contractName] = {};
 
   optList.forEach(o => {
     const k = Math.round(Number(o.StrikePrice || 0));
@@ -350,8 +353,8 @@ function buildLiveStrikeChainFromTaifex(optList, dayOiMap, spotPrice) {
       strikeMap[k] = {
         strike: k,
         isAtm: k === atmStrike,
-        callSymbol: "", callPrice: 0, callRef: 0, callChg: 0, callVol: 0, callOi: 0, callOiDelta: 0, callBid: 0, callAsk: 0, callAction: "SC",
-        putSymbol: "",  putPrice: 0,  putRef: 0,  putChg: 0,  putVol: 0,  putOi: 0,  putOiDelta: 0,  putBid: 0,  putAsk: 0,  putAction: "SP",
+        callSymbol: "", callPrice: 0, callRef: 0, callChg: 0, callVol: 0, callOi: 0, callOiDelta: 0, callBid: 0, callAsk: 0, callBidP: 0, callAskP: 0, callAction: "SC",
+        putSymbol: "",  putPrice: 0,  putRef: 0,  putChg: 0,  putVol: 0,  putOi: 0,  putOiDelta: 0,  putBid: 0,  putAsk: 0,  putBidP: 0,  putAskP: 0,  putAction: "SP",
         intradayCurve: [],
         weeklyCurve: []
       };
@@ -365,6 +368,12 @@ function buildLiveStrikeChainFromTaifex(optList, dayOiMap, spotPrice) {
     const oi = Number(o.OpenInterest || dayOiMap[oiKey] || 0);
     const bidSz = Number(o.CBestBidSize || o.CBidSize1 || 0);
     const askSz = Number(o.CBestAskSize || o.CAskSize1 || 0);
+    const bidP = Number(o.CBestBidPrice || o.CBidPrice1 || 0);
+    const askP = Number(o.CBestAskPrice || o.CAskPrice1 || 0);
+
+    if (contractName && lastP > 0) {
+      CONTRACT_PRICE_CACHE[contractName][`${k}_${o.CP}`] = { price: lastP, symbol: o.SymbolID || "", bidP, askP };
+    }
 
     if (o.CP === "C") {
       row.callSymbol = o.SymbolID || "";
@@ -375,6 +384,8 @@ function buildLiveStrikeChainFromTaifex(optList, dayOiMap, spotPrice) {
       row.callOi = oi;
       row.callBid = bidSz;
       row.callAsk = askSz;
+      row.callBidP = bidP;
+      row.callAskP = askP;
       // Price up or bid-heavy on Call = BC (買進買權); Price down or ask-heavy = SC (賣出買權)
       row.callAction = (chg > 0 || (chg === 0 && bidSz > askSz)) ? "BC" : "SC";
       row.callOiDelta = bidSz - askSz; // Real 5-level BestBid - BestAsk imbalance
@@ -387,6 +398,8 @@ function buildLiveStrikeChainFromTaifex(optList, dayOiMap, spotPrice) {
       row.putOi = oi;
       row.putBid = bidSz;
       row.putAsk = askSz;
+      row.putBidP = bidP;
+      row.putAskP = askP;
       // Price up or bid-heavy on Put = BP (買進賣權); Price down or ask-heavy = SP (賣出賣權)
       row.putAction = (chg > 0 || (chg === 0 && bidSz > askSz)) ? "BP" : "SP";
       row.putOiDelta = bidSz - askSz; // Real 5-level BestBid - BestAsk imbalance
@@ -449,6 +462,7 @@ function buildLiveStrikeChainFromTaifex(optList, dayOiMap, spotPrice) {
   });
 
   return {
+    contract: contractName || TAIFEX_EXPIRE_MONTH || "",
     strikes: nearStrikes,
     atmStrike,
     callWallStrike,
@@ -1986,15 +2000,21 @@ function resetSimAccount() {
   renderSimTab();
 }
 
-function getLiveOptionPrice(strike, cp) {
+function getLiveOptionPrice(strike, cp, contractName = "") {
+  if (contractName && CONTRACT_PRICE_CACHE[contractName] && CONTRACT_PRICE_CACHE[contractName][`${strike}_${cp}`]) {
+    return CONTRACT_PRICE_CACHE[contractName][`${strike}_${cp}`].price;
+  }
   if (!ACTIVE_CHAIN || !ACTIVE_CHAIN.strikes) return 0;
+  if (contractName && ACTIVE_CHAIN.contract && ACTIVE_CHAIN.contract !== contractName) {
+    return 0; // Do not cross-contaminate prices between different weekly contracts!
+  }
   const row = ACTIVE_CHAIN.strikes.find(x => x.strike === strike);
   if (!row) return 0;
   return cp === "C" ? row.callPrice : row.putPrice;
 }
 
 function calcPosUnrealized(pos) {
-  const curP = getLiveOptionPrice(pos.strike, pos.cp) || pos.entryPrice;
+  const curP = getLiveOptionPrice(pos.strike, pos.cp, pos.contract) || pos.entryPrice;
   const isBuyer = pos.action === "BC" || pos.action === "BP";
   const diffPts = isBuyer ? (curP - pos.entryPrice) : (pos.entryPrice - curP);
   return {
@@ -2008,7 +2028,8 @@ function placeSimOrder(customStrike = null, customAction = null, customLots = nu
   const action = customAction || SIM_FORM.action || "BC";
   const lots = Math.max(1, Number(customLots || SIM_FORM.lots || 1));
   const cp = (action === "BC" || action === "SC") ? "C" : "P";
-  const price = getLiveOptionPrice(strike, cp);
+  const activeContract = (ACTIVE_CHAIN && ACTIVE_CHAIN.contract) || TAIFEX_EXPIRE_MONTH || getSessionConfig().contract || "202611W4";
+  const price = getLiveOptionPrice(strike, cp, activeContract);
   if (!price || price <= 0) {
     if (!silent) alert("此履約價目前尚無有效報價，請選擇其他活躍履約價！");
     return;
@@ -2031,9 +2052,11 @@ function placeSimOrder(customStrike = null, customAction = null, customLots = nu
     SIM_STATE.cash = SIM_STATE.cash - (marginPerLot * lots) + premiumNtd;
   }
 
+  const symInfo = (CONTRACT_PRICE_CACHE[activeContract] && CONTRACT_PRICE_CACHE[activeContract][`${strike}_${cp}`]) || {};
   SIM_STATE.positions.unshift({
     id: String(Date.now()) + "_" + Math.floor(Math.random() * 1000),
-    contract: TAIFEX_EXPIRE_MONTH || getSessionConfig().contract || "202611W4",
+    contract: activeContract,
+    symbol: symInfo.symbol || "",
     strike,
     cp,
     action,
@@ -2268,10 +2291,10 @@ function renderSimTab() {
 
       <div style="background:#090e1a;border:1px solid var(--border);border-radius:10px;padding:12px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">
         <div style="font-size:0.82rem;line-height:1.6">
-          委託標的：<strong>${escapeHtml(TAIFEX_EXPIRE_MONTH || '近週選')} ${fmtNum(SIM_FORM.strike)} ${selCp === 'C' ? 'Call' : 'Put'}</strong> ｜
-          市價：<strong style="color:#fde047">${selPrice.toFixed(1)} 點</strong><br>
+          委託標的：<strong>${escapeHtml((ACTIVE_CHAIN && ACTIVE_CHAIN.contract) || TAIFEX_EXPIRE_MONTH || '近週選')} ${fmtNum(SIM_FORM.strike)} ${selCp === 'C' ? 'Call' : 'Put'}</strong> <span style="color:var(--muted);font-size:0.74rem">(${escapeHtml(selCp === 'C' ? selRow.callSymbol : selRow.putSymbol)})</span><br>
+          最新成交：<strong style="color:#fde047">${selPrice.toFixed(1)} 點</strong> (買一 ${selCp === 'C' ? (selRow.callBidP || '-') : (selRow.putBidP || '-')} / 賣一 ${selCp === 'C' ? (selRow.callAskP || '-') : (selRow.putAskP || '-')}) ｜
           ${isBuyer ? '權利金支出' : '權利金收入'}：<strong style="color:#38bdf8">NT$ ${fmtNum(estPrem)}</strong> ｜
-          所需資金/保證金：<strong>NT$ ${fmtNum(estMargin)}</strong>
+          保證金：<strong>NT$ ${fmtNum(estMargin)}</strong>
         </div>
         <button class="btn btn-primary" style="padding:10px 20px;font-size:0.9rem" onclick="placeSimOrder()">
           🚀 確認模擬下單 (${SIM_FORM.action} ${SIM_FORM.lots}口)
