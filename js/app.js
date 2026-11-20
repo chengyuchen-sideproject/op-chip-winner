@@ -354,7 +354,7 @@ function buildLiveStrikeChainFromTaifex(optList, dayOiMap, spotPrice) {
       row.callAsk = askSz;
       // Price up or bid-heavy on Call = BC (買進買權); Price down or ask-heavy = SC (賣出買權)
       row.callAction = (chg > 0 || (chg === 0 && bidSz > askSz)) ? "BC" : "SC";
-      row.callOiDelta = Math.round((chg >= 0 ? 1 : -1) * Math.min(oi, Math.round(vol * 0.22)));
+      row.callOiDelta = bidSz - askSz; // Real 5-level BestBid - BestAsk imbalance
     } else if (o.CP === "P") {
       row.putSymbol = o.SymbolID || "";
       row.putPrice = lastP;
@@ -366,43 +366,44 @@ function buildLiveStrikeChainFromTaifex(optList, dayOiMap, spotPrice) {
       row.putAsk = askSz;
       // Price up or bid-heavy on Put = BP (買進賣權); Price down or ask-heavy = SP (賣出賣權)
       row.putAction = (chg > 0 || (chg === 0 && bidSz > askSz)) ? "BP" : "SP";
-      row.putOiDelta = Math.round((chg >= 0 ? 1 : -1) * Math.min(oi, Math.round(vol * 0.22)));
+      row.putOiDelta = bidSz - askSz; // Real 5-level BestBid - BestAsk imbalance
     }
   });
 
-  // Filter strikes within ATM +/- 1200 pts so the T-table focuses on active strikes
+  // Compute full-contract totals across ALL strikes so P/C Ratio, OI Walls & Max Pain match TAIFEX 100%
   let allStrikes = Object.values(strikeMap).sort((a, b) => a.strike - b.strike);
-  let nearStrikes = allStrikes.filter(s => Math.abs(s.strike - atmStrike) <= 1200 && (s.callVol + s.putVol + s.callOi + s.putOi > 0));
-  if (nearStrikes.length < 8) nearStrikes = allStrikes.slice(Math.max(0, Math.floor(allStrikes.length / 2) - 10), Math.floor(allStrikes.length / 2) + 10);
-
   let maxCallOi = -1, callWallStrike = atmStrike + 300;
   let maxPutOi = -1, putWallStrike = atmStrike - 300;
   let totalCallOi = 0, totalPutOi = 0;
   let totalCallNetForce = 0; // >0 BC, <0 SC
   let totalPutNetForce = 0;  // >0 BP, <0 SP
 
-  nearStrikes.forEach(s => {
+  allStrikes.forEach(s => {
     const cWeight = s.callOi > 0 ? s.callOi : s.callVol;
     const pWeight = s.putOi > 0 ? s.putOi : s.putVol;
     totalCallOi += cWeight;
     totalPutOi += pWeight;
-    if (cWeight > maxCallOi) { maxCallOi = cWeight; callWallStrike = s.strike; }
-    if (pWeight > maxPutOi) { maxPutOi = pWeight; putWallStrike = s.strike; }
+    // For Call/Put walls, prefer actionable strikes near ATM (+/- 2500) if available, else full contract
+    if (Math.abs(s.strike - atmStrike) <= 2500 || maxCallOi < 0) {
+      if (cWeight > maxCallOi) { maxCallOi = cWeight; callWallStrike = s.strike; }
+    }
+    if (Math.abs(s.strike - atmStrike) <= 2500 || maxPutOi < 0) {
+      if (pWeight > maxPutOi) { maxPutOi = pWeight; putWallStrike = s.strike; }
+    }
 
-    // Active Call/Put Net Force in contracts:
-    // If Call price > RefPrice, buyers are actively lifting Call (+BC); if Call price < RefPrice, sellers are pressing Call (-SC)
     const cDir = s.callChg > 0 ? 1 : (s.callChg < 0 ? -1 : (s.callBid >= s.callAsk ? 0.3 : -0.3));
     const pDir = s.putChg > 0 ? 1 : (s.putChg < 0 ? -1 : (s.putBid >= s.putAsk ? 0.3 : -0.3));
-    totalCallNetForce += Math.round(s.callVol * cDir * 0.35);
-    totalPutNetForce += Math.round(s.putVol * pDir * 0.35);
+    totalCallNetForce += Math.round(s.callVol * cDir);
+    totalPutNetForce += Math.round(s.putVol * pDir);
   });
 
-  // Max Pain calculation
+  // Max Pain calculation across active strikes
+  const activeForPain = allStrikes.filter(s => (s.callOi + s.putOi + s.callVol + s.putVol) > 0);
   let minPayout = Infinity, maxPainStrike = atmStrike;
-  nearStrikes.forEach(cand => {
+  activeForPain.forEach(cand => {
     const sp = cand.strike;
     let payout = 0;
-    nearStrikes.forEach(s => {
+    activeForPain.forEach(s => {
       const cW = s.callOi || s.callVol;
       const pW = s.putOi || s.putVol;
       if (sp > s.strike) payout += (sp - s.strike) * cW;
@@ -410,6 +411,13 @@ function buildLiveStrikeChainFromTaifex(optList, dayOiMap, spotPrice) {
     });
     if (payout < minPayout) { minPayout = payout; maxPainStrike = sp; }
   });
+
+  // Display strikes within ATM +/- 1500 pts (plus Call/Put Wall if nearby)
+  let nearStrikes = allStrikes.filter(s =>
+    (Math.abs(s.strike - atmStrike) <= 1500 || s.strike === callWallStrike || s.strike === putWallStrike) &&
+    (s.callVol + s.putVol + s.callOi + s.putOi > 0)
+  );
+  if (nearStrikes.length < 8) nearStrikes = allStrikes.slice(Math.max(0, Math.floor(allStrikes.length / 2) - 10), Math.floor(allStrikes.length / 2) + 10);
 
   nearStrikes.forEach(s => {
     s.isCallWall = s.strike === callWallStrike;
@@ -1195,13 +1203,13 @@ function renderStrikesTab() {
             <th>主力判定</th>
             <th>籌碼分佈</th>
             <th>未平倉 (OI)</th>
-            <th>預估增減</th>
+            <th>委買賣差</th>
             <th>即時成交量</th>
             <th>最新價 (漲跌)</th>
             <th class="strike-col">Strike</th>
             <th>最新價 (漲跌)</th>
             <th>即時成交量</th>
-            <th>預估增減</th>
+            <th>委買賣差</th>
             <th>未平倉 (OI)</th>
             <th>籌碼分佈</th>
             <th>主力判定</th>
@@ -1740,6 +1748,39 @@ function renderAcademyTab() {
   const container = document.getElementById("tab-academy");
 
   container.innerHTML = `
+    <div class="panel-card">
+      <div class="panel-header">
+        <h2 class="section-h2">📖 籌碼判讀實戰指南（看懂三線圖、T字壓力支撐牆與 P/C Ratio）</h2>
+      </div>
+      <div class="advice-grid" style="margin-top:0">
+        <div class="advice-item">
+          <div style="color:#10b981;font-weight:800;margin-bottom:4px">1. CP 差額三線圖怎麼看？</div>
+          <div style="color:#e2e8f0">
+            • <strong>綠線 (CP 差額) &gt; 0 且向上</strong>：多方力道強於空方，偏多操作。<br>
+            • <strong>紅線 (Call) 在 0 軸上 (BC) ＋ 藍線 (Put) 在 0 軸下 (SP)</strong>：標準多頭攻擊盤。<br>
+            • <strong>藍線 (Put) 在 0 軸上 (BP) ＋ 紅線 (Call) 在 0 軸下 (SC)</strong>：標準空頭下殺盤。<br>
+            • <strong>紅線與藍線都在 0 軸下 (SC + SP)</strong>：莊家雙賣鎖區間，盤整收時間價值。
+          </div>
+        </div>
+        <div class="advice-item">
+          <div style="color:#38bdf8;font-weight:800;margin-bottom:4px">2. 台指期多空成本圖怎麼看？</div>
+          <div style="color:#e2e8f0">
+            • <strong>綠線 (VWAP 多空分界)</strong>：全市場當盤成交均價成本，<strong>線上偏多、線下偏空</strong>。<br>
+            • <strong>紅線 (短多成本)</strong>：指數站穩紅線之上代表多方買盤有撐。<br>
+            • <strong>藍線 (短空成本)</strong>：指數跌破藍線且無力站回，代表空方賣壓持續發酵。
+          </div>
+        </div>
+        <div class="advice-item">
+          <div style="color:#fbbf24;font-weight:800;margin-bottom:4px">3. T 字籌碼與 P/C Ratio 怎麼看？</div>
+          <div style="color:#e2e8f0">
+            • <strong>Call 最大 OI (壓力天花板)</strong>：大量賣方 (SC) 集結處，漲到此價位容易遇壓拉回。<br>
+            • <strong>Put 最大 OI (支撐地板)</strong>：大量賣方 (SP) 防守處，跌到此價位容易止跌。<br>
+            • <strong>P/C Ratio &gt; 100%</strong> 偏多有撐；<strong>&lt; 85%</strong> 偏空壓力大（代表 Call OI 遠大於 Put OI）。
+          </div>
+        </div>
+      </div>
+    </div>
+
     <div class="panel-card">
       <div class="panel-header">
         <h2 class="section-h2">選擇權基礎教學 — 四大基本動作 (BC / BP / SC / SP) 與互動損益試算</h2>
