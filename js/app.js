@@ -1820,6 +1820,16 @@ let SIM_STATE = loadSimState();
 let SIM_FORM = { action: "BC", strike: 0, lots: 1, whatIfSettle: 0 };
 let SIM_AUTO_CONFIG = { enabled: true, tpPct: 25, slPct: 20, allocBudgetPct: 30 };
 let SIM_LAST_AUTO_MSG = "";
+let SIM_EXPANDED_POS = new Set();
+
+function toggleSimPosExpand(posId) {
+  if (SIM_EXPANDED_POS.has(posId)) {
+    SIM_EXPANDED_POS.delete(posId);
+  } else {
+    SIM_EXPANDED_POS.add(posId);
+  }
+  renderSimTab();
+}
 
 function buildWeeklyAllocationRecommendations() {
   const chain = ACTIVE_CHAIN;
@@ -2013,9 +2023,12 @@ function mergeSimPositions(positions) {
   if (!Array.isArray(positions)) return [];
   const map = new Map();
   positions.forEach(p => {
+    const pLegs = Array.isArray(p.legs) && p.legs.length
+      ? p.legs.map(l => ({ ...l }))
+      : [{ lots: p.lots, price: p.entryPrice, time: p.time || "" }];
     const key = `${p.contract || ""}|${p.strike}|${p.action}`;
     if (!map.has(key)) {
-      map.set(key, { ...p });
+      map.set(key, { ...p, legs: pLegs });
     } else {
       const acc = map.get(key);
       const totalLots = acc.lots + p.lots;
@@ -2023,6 +2036,7 @@ function mergeSimPositions(positions) {
       acc.entryPrice = Math.round(weightedPrice * 100) / 100;
       acc.lots = totalLots;
       acc.marginLocked = (acc.marginLocked || 0) + (p.marginLocked || 0);
+      acc.legs = acc.legs.concat(pLegs);
       if (!acc.symbol && p.symbol) acc.symbol = p.symbol;
     }
   });
@@ -2119,6 +2133,10 @@ function placeSimOrder(customStrike = null, customAction = null, customLots = nu
     const existing = SIM_STATE.positions[existingIdx];
     const totalLots = existing.lots + lots;
     const weightedPrice = ((existing.entryPrice * existing.lots) + (price * lots)) / totalLots;
+    if (!Array.isArray(existing.legs) || !existing.legs.length) {
+      existing.legs = [{ lots: existing.lots, price: existing.entryPrice, time: existing.time || "" }];
+    }
+    existing.legs.unshift({ lots, price, time: nowTime });
     existing.entryPrice = Math.round(weightedPrice * 100) / 100;
     existing.lots = totalLots;
     existing.marginLocked = (existing.marginLocked || 0) + (isBuyer ? 0 : (marginPerLot * lots));
@@ -2137,7 +2155,8 @@ function placeSimOrder(customStrike = null, customAction = null, customLots = nu
       lots,
       entryPrice: price,
       marginLocked: isBuyer ? 0 : (marginPerLot * lots),
-      time: nowTime
+      time: nowTime,
+      legs: [{ lots, price, time: nowTime }]
     });
   }
 
@@ -2283,7 +2302,7 @@ function renderSimTab() {
           <span style="font-weight:700;color:#e2e8f0">本次投入可用資金比例：</span>
           <div style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px">
             ${[20, 30, 50, 80].map(pct => `
-              <button class="btn ${SIM_AUTO_CONFIG.allocBudgetPct === pct ? 'active' : ''}" style="padding:5px 4px;font-size:0.73rem;white-space:nowrap;text-align:center" onclick="SIM_AUTO_CONFIG.allocBudgetPct=${pct};renderSimTab()">${pct}% 資金</button>
+              <button class="btn ${SIM_AUTO_CONFIG.allocBudgetPct === pct ? 'active' : ''}" style="display:flex;align-items:center;justify-content:center;width:100%;padding:5px 4px;font-size:0.73rem;white-space:nowrap;text-align:center" onclick="SIM_AUTO_CONFIG.allocBudgetPct=${pct};renderSimTab()">${pct}% 資金</button>
             `).join("")}
           </div>
         </div>
@@ -2393,12 +2412,16 @@ function renderSimTab() {
         <div class="t-mobile-list" style="margin-bottom:16px">
           ${SIM_STATE.positions.map(pos => {
             const { curPrice, pnlNtd } = calcPosUnrealized(pos);
+            const legs = Array.isArray(pos.legs) && pos.legs.length ? pos.legs : [{ lots: pos.lots, price: pos.entryPrice, time: pos.time || "" }];
+            const isExpanded = SIM_EXPANDED_POS.has(pos.id);
+            const isBuyerPos = pos.action === "BC" || pos.action === "BP";
             return `
-              <div class="t-m-card" style="cursor:default">
+              <div class="t-m-card" style="cursor:pointer" onclick="toggleSimPosExpand('${pos.id}')">
                 <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
                   <div>
                     <span class="op-badge badge-${pos.action.toLowerCase()}">${pos.action}</span>
                     <strong style="margin-left:6px;font-size:0.95rem;color:#fff">${escapeHtml(pos.contract)} ${fmtNum(pos.strike)} ${pos.cp === 'C' ? 'Call' : 'Put'} × ${pos.lots}口</strong>
+                    ${legs.length > 1 ? `<span style="margin-left:6px;font-size:0.7rem;padding:1px 6px;border-radius:99px;background:rgba(56,189,248,0.18);color:#38bdf8;border:1px solid rgba(56,189,248,0.35)">${isExpanded ? '▴ 收合' : `▾ ${legs.length}筆明細`}</span>` : `<span style="margin-left:6px;font-size:0.7rem;color:var(--muted)">${isExpanded ? '▴' : '▾'}</span>`}
                     <div style="font-size:0.75rem;color:var(--muted);margin-top:3px">
                       進場均價: <strong>${pos.entryPrice.toFixed(1)}</strong> ｜ 目前市價: <strong style="color:#fde047">${curPrice.toFixed(1)}</strong> ｜ 更新時間: ${pos.time}
                     </div>
@@ -2408,9 +2431,24 @@ function renderSimTab() {
                       <div style="font-size:0.7rem;color:var(--muted)">未實現損益</div>
                       <strong style="font-size:1rem;color:${pnlNtd >= 0 ? '#f87171' : '#4ade80'}">${pnlNtd >= 0 ? '+' : ''}NT$ ${fmtNum(pnlNtd)}</strong>
                     </div>
-                    <button class="btn btn-primary" onclick="closeSimPosition('${pos.id}')">💰 平倉</button>
+                    <button class="btn btn-primary" onclick="event.stopPropagation();closeSimPosition('${pos.id}')">💰 平倉</button>
                   </div>
                 </div>
+                ${isExpanded ? `
+                  <div style="margin-top:10px;padding-top:8px;border-top:1px dashed rgba(148,163,184,0.28);display:flex;flex-direction:column;gap:5px">
+                    <div style="font-size:0.72rem;color:#94a3b8;font-weight:700">各筆成交明細（點擊收合）：</div>
+                    ${legs.map((leg, idx) => {
+                      const diffPts = isBuyerPos ? (curPrice - leg.price) : (leg.price - curPrice);
+                      const legPnl = Math.round(diffPts * 50 * leg.lots);
+                      return `
+                        <div style="display:flex;justify-content:space-between;align-items:center;font-size:0.75rem;background:rgba(15,23,42,0.55);padding:5px 8px;border-radius:6px">
+                          <span style="color:#cbd5e1">#${idx + 1} ｜ <strong>${leg.lots} 口</strong> @ <strong style="color:#e2e8f0">${Number(leg.price).toFixed(1)}</strong> <span style="color:var(--muted);font-size:0.7rem">(${leg.time || pos.time})</span></span>
+                          <strong style="color:${legPnl >= 0 ? '#f87171' : '#4ade80'}">${legPnl >= 0 ? '+' : ''}NT$ ${fmtNum(legPnl)}</strong>
+                        </div>
+                      `;
+                    }).join("")}
+                  </div>
+                ` : ''}
               </div>
             `;
           }).join("")}
