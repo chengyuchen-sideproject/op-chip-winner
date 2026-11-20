@@ -1821,6 +1821,7 @@ let SIM_FORM = { action: "BC", strike: 0, lots: 1, whatIfSettle: 0 };
 let SIM_AUTO_CONFIG = { enabled: true, tpPct: 25, slPct: 20, allocBudgetPct: 30 };
 let SIM_LAST_AUTO_MSG = "";
 let SIM_EXPANDED_POS = new Set();
+let SIM_EXPANDED_HIST = new Set();
 
 function toggleSimPosExpand(posId) {
   if (SIM_EXPANDED_POS.has(posId)) {
@@ -1828,6 +1829,38 @@ function toggleSimPosExpand(posId) {
   } else {
     SIM_EXPANDED_POS.add(posId);
   }
+  renderSimTab();
+}
+
+function toggleSimHistExpand(histId) {
+  if (SIM_EXPANDED_HIST.has(histId)) {
+    SIM_EXPANDED_HIST.delete(histId);
+  } else {
+    SIM_EXPANDED_HIST.add(histId);
+  }
+  renderSimTab();
+}
+
+function updateSimHistoryExitPrice(histId) {
+  const h = SIM_STATE.history.find(item => item.id === histId);
+  if (!h) return;
+  const inputEl = document.getElementById(`hist-exit-${histId}`);
+  if (!inputEl) return;
+  const newExit = Number(inputEl.value);
+  if (!Number.isFinite(newExit) || newExit < 0) {
+    alert("請輸入有效的賣價（大於或等於 0）！");
+    return;
+  }
+  const isBuyer = h.action === "BC" || h.action === "BP";
+  const diffPts = isBuyer ? (newExit - h.entryPrice) : (h.entryPrice - newExit);
+  const newPnl = Math.round(diffPts * 50 * h.lots);
+  const deltaPnl = newPnl - (h.pnlNtd || 0);
+  SIM_STATE.realizedPnl += deltaPnl;
+  SIM_STATE.cash += deltaPnl;
+  h.exitPrice = Math.round(newExit * 100) / 100;
+  h.pnlNtd = newPnl;
+  h.reasonTag = "手動修改賣價";
+  saveSimState();
   renderSimTab();
 }
 
@@ -2053,7 +2086,11 @@ function loadSimState() {
         cash: typeof p.cash === "number" ? p.cash : 500000,
         realizedPnl: typeof p.realizedPnl === "number" ? p.realizedPnl : 0,
         positions: mergeSimPositions(p.positions),
-        history: Array.isArray(p.history) ? p.history : []
+        history: Array.isArray(p.history) ? p.history.map((h, i) => ({
+          ...h,
+          id: h.id || `hist_${i}_${h.strike || 0}_${h.closeTime || ''}`,
+          legs: Array.isArray(h.legs) && h.legs.length ? h.legs : [{ lots: h.lots || 1, price: h.entryPrice || 0, time: h.closeTime || "" }]
+        })) : []
       };
     }
   } catch (e) {}
@@ -2188,6 +2225,7 @@ function closeSimPosition(posId, reasonTag = "手動平倉", silent = false) {
   SIM_STATE.realizedPnl += pnlNtd;
 
   SIM_STATE.history.unshift({
+    id: pos.id || (String(Date.now()) + "_" + Math.floor(Math.random() * 1000)),
     contract: pos.contract,
     strike: pos.strike,
     action: pos.action,
@@ -2196,7 +2234,8 @@ function closeSimPosition(posId, reasonTag = "手動平倉", silent = false) {
     exitPrice: curPrice,
     pnlNtd,
     reasonTag,
-    closeTime: new Date().toTimeString().slice(0, 8)
+    closeTime: new Date().toTimeString().slice(0, 8),
+    legs: Array.isArray(pos.legs) && pos.legs.length ? pos.legs : [{ lots: pos.lots, price: pos.entryPrice, time: pos.time || "" }]
   });
   if (SIM_STATE.history.length > 30) SIM_STATE.history.pop();
 
@@ -2231,7 +2270,10 @@ function renderSimTab() {
   }
 
   const selRow = chain.strikes.find(s => s.strike === SIM_FORM.strike) || chain.strikes[0];
-  const selCp = (SIM_FORM.action === "BC" || SIM_FORM.action === "SC") ? "C" : "P";
+  if (SIM_FORM.action !== "BC" && SIM_FORM.action !== "BP") {
+    SIM_FORM.action = SIM_FORM.action === "SP" ? "BP" : "BC";
+  }
+  const selCp = SIM_FORM.action === "BC" ? "C" : "P";
   const selPrice = selCp === "C" ? selRow.callPrice : selRow.putPrice;
   const isBuyer = SIM_FORM.action === "BC" || SIM_FORM.action === "BP";
   const estPrem = Math.round(selPrice * 50 * SIM_FORM.lots);
@@ -2350,8 +2392,9 @@ function renderSimTab() {
     <div class="panel-card">
       <div class="panel-header">
         <div>
-          <h2 class="section-h2">🎮 特定週選擇權模擬下單（對接期交所即時報價）</h2>
-          <div style="font-size:0.77rem;color:var(--muted);margin-top:3px">選擇目標週選合約、履約價與 BC/SC/BP/SP 方向，測試策略真實跳動盈虧</div>
+          <h2 class="section-h2">🎮 特定週選擇權模擬下單</h2>
+          <div style="font-size:0.78rem;color:#38bdf8;font-weight:700;margin-top:2px">（對接期交所即時報價）</div>
+          <div style="font-size:0.77rem;color:var(--muted);margin-top:3px">選擇目標週選合約、履約價與 BC/BP 買方方向，測試策略真實跳動盈虧</div>
         </div>
         ${TAIFEX_AVAILABLE_MONTHS.length ? `
           <select class="select-input" onchange="TAIFEX_EXPIRE_MONTH=this.value;fetchLiveTaifexData()">
@@ -2364,10 +2407,8 @@ function renderSimTab() {
         <div>
           <div style="font-size:0.75rem;color:var(--muted);margin-bottom:4px">1. 選擇操作方向 (Action)</div>
           <div class="btn-group">
-            <button class="btn ${SIM_FORM.action === 'BC' ? 'active' : ''}" onclick="SIM_FORM.action='BC';renderSimTab()">BC 買買權</button>
-            <button class="btn ${SIM_FORM.action === 'SC' ? 'active' : ''}" onclick="SIM_FORM.action='SC';renderSimTab()">SC 賣買權</button>
+            <button class="btn ${SIM_FORM.action !== 'BP' ? 'active' : ''}" onclick="SIM_FORM.action='BC';renderSimTab()">BC 買買權</button>
             <button class="btn ${SIM_FORM.action === 'BP' ? 'active' : ''}" onclick="SIM_FORM.action='BP';renderSimTab()">BP 買賣權</button>
-            <button class="btn ${SIM_FORM.action === 'SP' ? 'active' : ''}" onclick="SIM_FORM.action='SP';renderSimTab()">SP 賣賣權</button>
           </div>
         </div>
 
@@ -2406,7 +2447,7 @@ function renderSimTab() {
     <!-- Open Positions & Settlement What-If Simulator -->
     <div class="panel-card">
       <div class="panel-header">
-        <h2 class="section-h2">目前模擬持倉部位與「週選結算模擬器」</h2>
+        <h2 class="section-h2">模擬持倉部位與「結算模擬器」</h2>
       </div>
       ${SIM_STATE.positions.length ? `
         <div class="t-mobile-list" style="margin-bottom:16px">
@@ -2476,12 +2517,48 @@ function renderSimTab() {
       <div class="panel-card">
         <div class="panel-header"><h2 class="section-h2">歷史模擬平倉紀錄</h2></div>
         <div class="t-mobile-list">
-          ${SIM_STATE.history.slice(0, 10).map(h => `
-            <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 10px;background:#090e1a;border-radius:8px;font-size:0.8rem">
-              <div><span class="op-badge badge-${h.action.toLowerCase()}">${h.action}</span> <strong>${escapeHtml(h.contract)} ${fmtNum(h.strike)}</strong> × ${h.lots}口 (${h.entryPrice} ➔ ${h.exitPrice})</div>
-              <strong style="color:${h.pnlNtd >= 0 ? '#f87171' : '#4ade80'}">${h.pnlNtd >= 0 ? '+' : ''}NT$ ${fmtNum(h.pnlNtd)}</strong>
-            </div>
-          `).join("")}
+          ${SIM_STATE.history.slice(0, 10).map((h, idx) => {
+            const histId = h.id || `hist_${idx}`;
+            const isExpanded = SIM_EXPANDED_HIST.has(histId);
+            const legs = Array.isArray(h.legs) && h.legs.length ? h.legs : [{ lots: h.lots, price: h.entryPrice, time: h.closeTime || "" }];
+            const isBuyerHist = h.action === "BC" || h.action === "BP";
+            return `
+              <div style="padding:8px 10px;background:#090e1a;border:1px solid rgba(148,163,184,0.18);border-radius:8px;font-size:0.8rem;cursor:pointer" onclick="toggleSimHistExpand('${histId}')">
+                <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
+                  <div>
+                    <span class="op-badge badge-${h.action.toLowerCase()}">${h.action}</span>
+                    <strong>${escapeHtml(h.contract)} ${fmtNum(h.strike)}</strong> × ${h.lots}口
+                    <span style="color:#cbd5e1">(${Number(h.entryPrice).toFixed(1)} ➔ <strong style="color:#fde047">${Number(h.exitPrice).toFixed(1)}</strong>)</span>
+                    <span style="margin-left:4px;font-size:0.68rem;padding:1px 6px;border-radius:99px;background:rgba(56,189,248,0.16);color:#38bdf8">${isExpanded ? '▴ 收合' : `▾ 明細${legs.length > 1 ? `(${legs.length}筆)` : ''}`}</span>
+                  </div>
+                  <strong style="color:${h.pnlNtd >= 0 ? '#f87171' : '#4ade80'}">${h.pnlNtd >= 0 ? '+' : ''}NT$ ${fmtNum(h.pnlNtd)}</strong>
+                </div>
+                ${isExpanded ? `
+                  <div style="margin-top:8px;padding-top:8px;border-top:1px dashed rgba(148,163,184,0.28);display:flex;flex-direction:column;gap:6px" onclick="event.stopPropagation()">
+                    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px;background:rgba(15,23,42,0.75);padding:6px 8px;border-radius:6px">
+                      <span style="font-size:0.74rem;color:#94a3b8">平倉時間：${escapeHtml(h.closeTime || '')} ｜ 備註：${escapeHtml(h.reasonTag || '平倉')}</span>
+                      <div style="display:flex;align-items:center;gap:6px">
+                        <label style="font-size:0.74rem;color:#cbd5e1">修改賣價：</label>
+                        <input id="hist-exit-${histId}" type="number" step="0.1" min="0" value="${Number(h.exitPrice)}" class="select-input" style="width:82px;padding:3px 6px;font-size:0.78rem;text-align:right">
+                        <button class="btn btn-primary" style="padding:3px 10px;font-size:0.74rem" onclick="updateSimHistoryExitPrice('${histId}')">儲存賣價</button>
+                      </div>
+                    </div>
+                    <div style="font-size:0.72rem;color:#94a3b8;font-weight:700">各筆成交明細：</div>
+                    ${legs.map((leg, lIdx) => {
+                      const diffPts = isBuyerHist ? (Number(h.exitPrice) - leg.price) : (leg.price - Number(h.exitPrice));
+                      const legPnl = Math.round(diffPts * 50 * leg.lots);
+                      return `
+                        <div style="display:flex;justify-content:space-between;align-items:center;font-size:0.74rem;background:rgba(15,23,42,0.55);padding:5px 8px;border-radius:6px">
+                          <span style="color:#cbd5e1">#${lIdx + 1} ｜ <strong>${leg.lots} 口</strong> @ <strong style="color:#e2e8f0">${Number(leg.price).toFixed(1)}</strong> <span style="color:var(--muted);font-size:0.7rem">(${leg.time || h.closeTime || ''})</span></span>
+                          <strong style="color:${legPnl >= 0 ? '#f87171' : '#4ade80'}">${legPnl >= 0 ? '+' : ''}NT$ ${fmtNum(legPnl)}</strong>
+                        </div>
+                      `;
+                    }).join("")}
+                  </div>
+                ` : ''}
+              </div>
+            `;
+          }).join("")}
         </div>
       </div>
     ` : ''}
