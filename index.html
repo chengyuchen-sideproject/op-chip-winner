@@ -29,9 +29,9 @@
       <nav class="top-nav-links">
         <button class="top-nav-btn active" data-tab="realtime" onclick="switchView('realtime')">📊 即時籌碼三線圖</button>
         <button class="top-nav-btn" data-tab="strikes" onclick="switchView('strikes')">🎯 選擇權籌碼 T 字表</button>
-        <button class="top-nav-btn" data-tab="replay" onclick="switchView('replay')">⏪ K線盤勢復盤模擬</button>
-        <button class="top-nav-btn" data-tab="analysis" onclick="switchView('analysis')">📑 盤勢分析報告</button>
-        <button class="top-nav-btn" data-tab="academy" onclick="switchView('academy')">🎓 選擇權基礎教學</button>
+        <button class="top-nav-btn" data-tab="sim" onclick="switchView('sim')">🎮 週選模擬操作</button>
+        <button class="top-nav-btn" data-tab="replay" onclick="switchView('replay')">⏪ K線盤勢復盤</button>
+        <button class="top-nav-btn" data-tab="academy" onclick="switchView('academy')">🎓 盤勢分析與教學</button>
       </nav>
     </div>
   </header>
@@ -45,8 +45,8 @@
   <main class="main-container">
     <section id="tab-realtime" class="tab-view active"></section>
     <section id="tab-strikes" class="tab-view"></section>
+    <section id="tab-sim" class="tab-view"></section>
     <section id="tab-replay" class="tab-view"></section>
-    <section id="tab-analysis" class="tab-view"></section>
     <section id="tab-academy" class="tab-view"></section>
   </main>
 
@@ -65,17 +65,17 @@
       <span style="font-size:1.15rem">🎯</span>
       <span>T字籌碼</span>
     </button>
+    <button class="m-nav-btn" data-tab="sim" onclick="switchView('sim')">
+      <span style="font-size:1.15rem">🎮</span>
+      <span>模擬操作</span>
+    </button>
     <button class="m-nav-btn" data-tab="replay" onclick="switchView('replay')">
       <span style="font-size:1.15rem">⏪</span>
       <span>K線復盤</span>
     </button>
-    <button class="m-nav-btn" data-tab="analysis" onclick="switchView('analysis')">
-      <span style="font-size:1.15rem">📑</span>
-      <span>盤勢分析</span>
-    </button>
     <button class="m-nav-btn" data-tab="academy" onclick="switchView('academy')">
       <span style="font-size:1.15rem">🎓</span>
-      <span>基礎教學</span>
+      <span>分析教學</span>
     </button>
   </nav>
 

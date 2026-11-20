@@ -297,7 +297,8 @@ async function fetchLiveTaifexData() {
     updateTickerBar();
     if (CURRENT_TAB === "realtime") { renderRealtimeTab(); TAB_DIRTY.realtime = false; }
     else if (CURRENT_TAB === "strikes") { renderStrikesTab(); TAB_DIRTY.strikes = false; }
-    else if (CURRENT_TAB === "analysis") { renderAnalysisTab(); TAB_DIRTY.analysis = false; }
+    else if (CURRENT_TAB === "sim") { renderSimTab(); TAB_DIRTY.sim = false; }
+    else if (CURRENT_TAB === "academy") { renderAcademyTab(); TAB_DIRTY.academy = false; }
   } catch (err) {
     TAIFEX_STATUS.connected = false;
     TAIFEX_STATUS.errorMsg = err.message || String(err);
@@ -615,14 +616,14 @@ function updateTickerBar() {
 // ============================================================================
 // Navigation & Zero-Lag Tab Caching
 // ============================================================================
-const TAB_DIRTY = { realtime: true, strikes: true, replay: true, analysis: true, academy: true };
+const TAB_DIRTY = { realtime: true, strikes: true, sim: true, replay: true, academy: true };
 
 function markAllTabsDirty() {
   TAB_DIRTY.realtime = true;
   TAB_DIRTY.strikes = true;
+  TAB_DIRTY.sim = true;
   TAB_DIRTY.replay = true;
-  TAB_DIRTY.analysis = true;
-  // academy is static+interactive, only render once unless clicked
+  TAB_DIRTY.academy = true;
 }
 
 function switchView(tabId) {
@@ -640,8 +641,8 @@ function switchView(tabId) {
 
   if (tabId === "realtime") renderRealtimeTab();
   else if (tabId === "strikes") renderStrikesTab();
+  else if (tabId === "sim") renderSimTab();
   else if (tabId === "replay") renderReplayTab();
-  else if (tabId === "analysis") renderAnalysisTab();
   else if (tabId === "academy") renderAcademyTab();
 }
 
@@ -1357,6 +1358,16 @@ async function openStrikeModal(strikeIdx) {
       ${s.callSymbol ? '📡 正在向臺灣期貨交易所 (getChartData1M) 載入此履約價 1 分鐘真實量價曲線...' : ''}
     </div>
 
+    <div style="background:rgba(37,99,235,0.12);border:1px solid rgba(56,189,248,0.35);border-radius:10px;padding:10px 12px;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+      <span style="font-size:0.8rem;font-weight:700;color:#fde047">🎮 針對 ${escapeHtml(TAIFEX_EXPIRE_MONTH || '近週選')} ${fmtNum(s.strike)} 一鍵模擬下單 (1口)：</span>
+      <div class="btn-group">
+        <button class="btn" style="border-color:#ef4444;color:#fca5a5" onclick="quickSimOrderFromModal(${s.strike},'BC')">BC 買買權 (${s.callPrice})</button>
+        <button class="btn" style="border-color:#22c55e;color:#86efac" onclick="quickSimOrderFromModal(${s.strike},'SC')">SC 賣買權 (${s.callPrice})</button>
+        <button class="btn" style="border-color:#3b82f6;color:#93c5fd" onclick="quickSimOrderFromModal(${s.strike},'BP')">BP 買賣權 (${s.putPrice})</button>
+        <button class="btn" style="border-color:#f59e0b;color:#fde047" onclick="quickSimOrderFromModal(${s.strike},'SP')">SP 賣賣權 (${s.putPrice})</button>
+      </div>
+    </div>
+
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:14px">
       <div class="chart-wrap">
         <div style="font-size:0.82rem;font-weight:700;color:#fca5a5;margin-bottom:6px">🔴 ${fmtNum(s.strike)} Call 買權 — 當日分時權利金與成交量曲線</div>
@@ -1666,6 +1677,385 @@ function drawKlineWithCostCanvas(canvasId, bars, maxIdx) {
 }
 
 // ============================================================================
+// Tab 3.5: 特定週選擇權模擬操作系統 (Paper Trading + Settlement Simulator)
+// ============================================================================
+const SIM_STORAGE_KEY = "op_chip_winner_sim_v1";
+let SIM_STATE = loadSimState();
+let SIM_FORM = { action: "BC", strike: 0, lots: 1, whatIfSettle: 0 };
+
+function loadSimState() {
+  try {
+    const raw = localStorage.getItem(SIM_STORAGE_KEY);
+    if (raw) {
+      const p = JSON.parse(raw);
+      return {
+        initialCapital: p.initialCapital || 500000,
+        cash: typeof p.cash === "number" ? p.cash : 500000,
+        realizedPnl: typeof p.realizedPnl === "number" ? p.realizedPnl : 0,
+        positions: Array.isArray(p.positions) ? p.positions : [],
+        history: Array.isArray(p.history) ? p.history : []
+      };
+    }
+  } catch (e) {}
+  return { initialCapital: 500000, cash: 500000, realizedPnl: 0, positions: [], history: [] };
+}
+
+function saveSimState() {
+  try {
+    localStorage.setItem(SIM_STORAGE_KEY, JSON.stringify(SIM_STATE));
+  } catch (e) {}
+}
+
+function resetSimAccount() {
+  SIM_STATE = { initialCapital: 500000, cash: 500000, realizedPnl: 0, positions: [], history: [] };
+  saveSimState();
+  renderSimTab();
+}
+
+function getLiveOptionPrice(strike, cp) {
+  if (!ACTIVE_CHAIN || !ACTIVE_CHAIN.strikes) return 0;
+  const row = ACTIVE_CHAIN.strikes.find(x => x.strike === strike);
+  if (!row) return 0;
+  return cp === "C" ? row.callPrice : row.putPrice;
+}
+
+function calcPosUnrealized(pos) {
+  const curP = getLiveOptionPrice(pos.strike, pos.cp) || pos.entryPrice;
+  const isBuyer = pos.action === "BC" || pos.action === "BP";
+  const diffPts = isBuyer ? (curP - pos.entryPrice) : (pos.entryPrice - curP);
+  return {
+    curPrice: curP,
+    pnlNtd: Math.round(diffPts * 50 * pos.lots)
+  };
+}
+
+function placeSimOrder(customStrike = null, customAction = null, customLots = null) {
+  const strike = Number(customStrike || SIM_FORM.strike || (ACTIVE_CHAIN ? ACTIVE_CHAIN.atmStrike : 35000));
+  const action = customAction || SIM_FORM.action || "BC";
+  const lots = Math.max(1, Number(customLots || SIM_FORM.lots || 1));
+  const cp = (action === "BC" || action === "SC") ? "C" : "P";
+  const price = getLiveOptionPrice(strike, cp);
+  if (!price || price <= 0) {
+    alert("此履約價目前尚無有效報價，請選擇其他活躍履約價！");
+    return;
+  }
+
+  const isBuyer = action === "BC" || action === "BP";
+  const premiumNtd = Math.round(price * 50 * lots);
+  const marginPerLot = 35000;
+  const requiredCash = isBuyer ? premiumNtd : (marginPerLot * lots);
+
+  if (SIM_STATE.cash < requiredCash) {
+    alert(`可用模擬資金不足！需要 NT$${fmtNum(requiredCash)}，目前可用 NT$${fmtNum(SIM_STATE.cash)}`);
+    return;
+  }
+
+  if (isBuyer) {
+    SIM_STATE.cash -= premiumNtd;
+  } else {
+    // Seller collects premium into cash, locks margin
+    SIM_STATE.cash = SIM_STATE.cash - (marginPerLot * lots) + premiumNtd;
+  }
+
+  SIM_STATE.positions.unshift({
+    id: String(Date.now()) + "_" + Math.floor(Math.random() * 1000),
+    contract: TAIFEX_EXPIRE_MONTH || getSessionConfig().contract || "202611W4",
+    strike,
+    cp,
+    action,
+    lots,
+    entryPrice: price,
+    marginLocked: isBuyer ? 0 : (marginPerLot * lots),
+    time: new Date().toTimeString().slice(0, 8)
+  });
+
+  saveSimState();
+  TAB_DIRTY.sim = false;
+  if (CURRENT_TAB === "sim") renderSimTab();
+}
+
+function quickSimOrderFromModal(strike, action) {
+  document.getElementById("strikeModal").style.display = "none";
+  SIM_FORM.strike = strike;
+  SIM_FORM.action = action;
+  placeSimOrder(strike, action, 1);
+  switchView("sim");
+}
+
+function closeSimPosition(posId) {
+  const idx = SIM_STATE.positions.findIndex(p => p.id === posId);
+  if (idx === -1) return;
+  const pos = SIM_STATE.positions[idx];
+  const { curPrice, pnlNtd } = calcPosUnrealized(pos);
+  const isBuyer = pos.action === "BC" || pos.action === "BP";
+
+  if (isBuyer) {
+    SIM_STATE.cash += Math.round(curPrice * 50 * pos.lots);
+  } else {
+    SIM_STATE.cash += pos.marginLocked - Math.round(curPrice * 50 * pos.lots);
+  }
+  SIM_STATE.realizedPnl += pnlNtd;
+
+  SIM_STATE.history.unshift({
+    contract: pos.contract,
+    strike: pos.strike,
+    action: pos.action,
+    lots: pos.lots,
+    entryPrice: pos.entryPrice,
+    exitPrice: curPrice,
+    pnlNtd,
+    closeTime: new Date().toTimeString().slice(0, 8)
+  });
+  if (SIM_STATE.history.length > 30) SIM_STATE.history.pop();
+
+  SIM_STATE.positions.splice(idx, 1);
+  saveSimState();
+  renderSimTab();
+}
+
+function calcTotalExpirationPnl(settleIdx) {
+  let total = 0;
+  SIM_STATE.positions.forEach(pos => {
+    let intrinsic = 0;
+    if (pos.cp === "C") intrinsic = Math.max(0, settleIdx - pos.strike);
+    else intrinsic = Math.max(0, pos.strike - settleIdx);
+    const isBuyer = pos.action === "BC" || pos.action === "BP";
+    const diffPts = isBuyer ? (intrinsic - pos.entryPrice) : (pos.entryPrice - intrinsic);
+    total += Math.round(diffPts * 50 * pos.lots);
+  });
+  return total;
+}
+
+function renderSimTab() {
+  const chain = ACTIVE_CHAIN;
+  if (!chain || !chain.strikes.length) return;
+  const container = document.getElementById("tab-sim");
+
+  if (!SIM_FORM.strike || !chain.strikes.find(s => s.strike === SIM_FORM.strike)) {
+    SIM_FORM.strike = chain.atmStrike;
+  }
+  if (!SIM_FORM.whatIfSettle) {
+    SIM_FORM.whatIfSettle = chain.atmStrike;
+  }
+
+  const selRow = chain.strikes.find(s => s.strike === SIM_FORM.strike) || chain.strikes[0];
+  const selCp = (SIM_FORM.action === "BC" || SIM_FORM.action === "SC") ? "C" : "P";
+  const selPrice = selCp === "C" ? selRow.callPrice : selRow.putPrice;
+  const isBuyer = SIM_FORM.action === "BC" || SIM_FORM.action === "BP";
+  const estPrem = Math.round(selPrice * 50 * SIM_FORM.lots);
+  const estMargin = isBuyer ? estPrem : (35000 * SIM_FORM.lots);
+
+  let totalUnrealized = 0;
+  let totalLockedMargin = 0;
+  let totalBuyMarketVal = 0;
+  SIM_STATE.positions.forEach(p => {
+    const u = calcPosUnrealized(p);
+    totalUnrealized += u.pnlNtd;
+    totalLockedMargin += (p.marginLocked || 0);
+    if (p.action === "BC" || p.action === "BP") {
+      totalBuyMarketVal += Math.round(u.curPrice * 50 * p.lots);
+    }
+  });
+  const totalEquity = SIM_STATE.initialCapital + SIM_STATE.realizedPnl + totalUnrealized;
+  const settleMin = chain.atmStrike - 1500;
+  const settleMax = chain.atmStrike + 1500;
+  const whatIfPnl = calcTotalExpirationPnl(SIM_FORM.whatIfSettle);
+
+  container.innerHTML = `
+    <!-- Account Summary KPIs -->
+    <div class="kpi-grid">
+      <div class="kpi-card">
+        <div class="kpi-label"><span>💰 模擬總權益數</span><button class="btn" style="padding:2px 8px;font-size:0.7rem" onclick="resetSimAccount()">🔄 重置50萬</button></div>
+        <div class="kpi-val" style="color:#fde047">NT$ ${fmtNum(totalEquity)}</div>
+        <div class="kpi-sub">可用餘額: <strong>NT$ ${fmtNum(SIM_STATE.cash)}</strong></div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-label"><span>📈 未實現浮動損益</span><span>${SIM_STATE.positions.length} 筆持倉</span></div>
+        <div class="kpi-val" style="color:${totalUnrealized >= 0 ? '#f87171' : '#4ade80'}">${totalUnrealized >= 0 ? '+' : ''}NT$ ${fmtNum(totalUnrealized)}</div>
+        <div class="kpi-sub">賣方鎖定保證金: NT$ ${fmtNum(totalLockedMargin)}</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-label"><span>✅ 已實現累計損益</span><span>${SIM_STATE.history.length} 筆平倉</span></div>
+        <div class="kpi-val" style="color:${SIM_STATE.realizedPnl >= 0 ? '#f87171' : '#4ade80'}">${SIM_STATE.realizedPnl >= 0 ? '+' : ''}NT$ ${fmtNum(SIM_STATE.realizedPnl)}</div>
+        <div class="kpi-sub">每點乘數 NT$50 (台指選擇權標準)</div>
+      </div>
+    </div>
+
+    <!-- Order Entry Panel for Specific Weekly Option Contract -->
+    <div class="panel-card">
+      <div class="panel-header">
+        <div>
+          <h2 class="section-h2">🎮 特定週選擇權模擬下單（對接期交所即時報價）</h2>
+          <div style="font-size:0.77rem;color:var(--muted);margin-top:3px">選擇目標週選合約、履約價與 BC/SC/BP/SP 方向，測試策略真實跳動盈虧</div>
+        </div>
+        ${TAIFEX_AVAILABLE_MONTHS.length ? `
+          <select class="select-input" onchange="TAIFEX_EXPIRE_MONTH=this.value;fetchLiveTaifexData()">
+            ${TAIFEX_AVAILABLE_MONTHS.map(m => `<option value="${m}" ${m === TAIFEX_EXPIRE_MONTH ? 'selected' : ''}>目標合約：${m}</option>`).join("")}
+          </select>
+        ` : ''}
+      </div>
+
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px;margin-bottom:12px">
+        <div>
+          <div style="font-size:0.75rem;color:var(--muted);margin-bottom:4px">1. 選擇操作方向 (Action)</div>
+          <div class="btn-group">
+            <button class="btn ${SIM_FORM.action === 'BC' ? 'active' : ''}" onclick="SIM_FORM.action='BC';renderSimTab()">BC 買買權</button>
+            <button class="btn ${SIM_FORM.action === 'SC' ? 'active' : ''}" onclick="SIM_FORM.action='SC';renderSimTab()">SC 賣買權</button>
+            <button class="btn ${SIM_FORM.action === 'BP' ? 'active' : ''}" onclick="SIM_FORM.action='BP';renderSimTab()">BP 買賣權</button>
+            <button class="btn ${SIM_FORM.action === 'SP' ? 'active' : ''}" onclick="SIM_FORM.action='SP';renderSimTab()">SP 賣賣權</button>
+          </div>
+        </div>
+
+        <div>
+          <div style="font-size:0.75rem;color:var(--muted);margin-bottom:4px">2. 選擇履約價 (Strike)</div>
+          <select class="select-input" style="width:100%" onchange="SIM_FORM.strike=Number(this.value);renderSimTab()">
+            ${chain.strikes.map(s => `
+              <option value="${s.strike}" ${s.strike === SIM_FORM.strike ? 'selected' : ''}>
+                ${fmtNum(s.strike)} ${s.isAtm ? '(價平)' : (s.isCallWall ? '(壓力頂)' : (s.isPutWall ? '(支撐底)' : ''))} — Call:${s.callPrice} / Put:${s.putPrice}
+              </option>
+            `).join("")}
+          </select>
+        </div>
+
+        <div>
+          <div style="font-size:0.75rem;color:var(--muted);margin-bottom:4px">3. 下單口數 (Lots)</div>
+          <div class="btn-group">
+            ${[1, 2, 5, 10].map(n => `<button class="btn ${SIM_FORM.lots === n ? 'active' : ''}" onclick="SIM_FORM.lots=${n};renderSimTab()">${n} 口</button>`).join("")}
+          </div>
+        </div>
+      </div>
+
+      <div style="background:#090e1a;border:1px solid var(--border);border-radius:10px;padding:12px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">
+        <div style="font-size:0.82rem;line-height:1.6">
+          委託標的：<strong>${escapeHtml(TAIFEX_EXPIRE_MONTH || '近週選')} ${fmtNum(SIM_FORM.strike)} ${selCp === 'C' ? 'Call' : 'Put'}</strong> ｜
+          市價：<strong style="color:#fde047">${selPrice.toFixed(1)} 點</strong><br>
+          ${isBuyer ? '權利金支出' : '權利金收入'}：<strong style="color:#38bdf8">NT$ ${fmtNum(estPrem)}</strong> ｜
+          所需資金/保證金：<strong>NT$ ${fmtNum(estMargin)}</strong>
+        </div>
+        <button class="btn btn-primary" style="padding:10px 20px;font-size:0.9rem" onclick="placeSimOrder()">
+          🚀 確認模擬下單 (${SIM_FORM.action} ${SIM_FORM.lots}口)
+        </button>
+      </div>
+    </div>
+
+    <!-- Open Positions & Settlement What-If Simulator -->
+    <div class="panel-card">
+      <div class="panel-header">
+        <h2 class="section-h2">目前模擬持倉部位與「週選結算模擬器」</h2>
+      </div>
+      ${SIM_STATE.positions.length ? `
+        <div class="t-mobile-list" style="margin-bottom:16px">
+          ${SIM_STATE.positions.map(pos => {
+            const { curPrice, pnlNtd } = calcPosUnrealized(pos);
+            return `
+              <div class="t-m-card" style="cursor:default">
+                <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+                  <div>
+                    <span class="op-badge badge-${pos.action.toLowerCase()}">${pos.action}</span>
+                    <strong style="margin-left:6px;font-size:0.95rem;color:#fff">${escapeHtml(pos.contract)} ${fmtNum(pos.strike)} ${pos.cp === 'C' ? 'Call' : 'Put'} × ${pos.lots}口</strong>
+                    <div style="font-size:0.75rem;color:var(--muted);margin-top:3px">
+                      進場價: <strong>${pos.entryPrice.toFixed(1)}</strong> ｜ 目前市價: <strong style="color:#fde047">${curPrice.toFixed(1)}</strong> ｜ 進場時間: ${pos.time}
+                    </div>
+                  </div>
+                  <div style="display:flex;align-items:center;gap:10px">
+                    <div style="text-align:right">
+                      <div style="font-size:0.7rem;color:var(--muted)">未實現損益</div>
+                      <strong style="font-size:1rem;color:${pnlNtd >= 0 ? '#f87171' : '#4ade80'}">${pnlNtd >= 0 ? '+' : ''}NT$ ${fmtNum(pnlNtd)}</strong>
+                    </div>
+                    <button class="btn btn-primary" onclick="closeSimPosition('${pos.id}')">💰 平倉</button>
+                  </div>
+                </div>
+              </div>
+            `;
+          }).join("")}
+        </div>
+
+        <!-- What-If Expiration Settlement Simulator -->
+        <div style="background:#090e1a;border:1px solid var(--border);border-radius:10px;padding:12px">
+          <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:8px">
+            <span style="font-size:0.84rem;font-weight:700;color:#38bdf8">🔮 結算模擬器：假設週三結算指數 ＝ <strong style="color:#fde047;font-size:1rem">${fmtNum(SIM_FORM.whatIfSettle)}</strong></span>
+            <span style="font-size:0.92rem;font-weight:800;color:${whatIfPnl >= 0 ? '#f87171' : '#4ade80'}">預估到期總損益：${whatIfPnl >= 0 ? '+' : ''}NT$ ${fmtNum(whatIfPnl)}</span>
+          </div>
+          <input type="range" min="${settleMin}" max="${settleMax}" step="50" value="${SIM_FORM.whatIfSettle}" style="width:100%;margin-bottom:8px" oninput="SIM_FORM.whatIfSettle=Number(this.value);renderSimTab()">
+          <div class="chart-wrap">
+            <canvas id="simPortfolioPayoffCanvas" width="1040" height="190"></canvas>
+          </div>
+        </div>
+      ` : `
+        <div style="text-align:center;padding:24px;color:var(--muted);font-size:0.86rem">
+          目前尚無模擬持倉部位。請於上方選擇週選合約與履約價下單，或到「🎯 T字籌碼」點擊任一履約價一鍵模擬！
+        </div>
+      `}
+    </div>
+
+    ${SIM_STATE.history.length ? `
+      <div class="panel-card">
+        <div class="panel-header"><h2 class="section-h2">歷史模擬平倉紀錄</h2></div>
+        <div class="t-mobile-list">
+          ${SIM_STATE.history.slice(0, 10).map(h => `
+            <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 10px;background:#090e1a;border-radius:8px;font-size:0.8rem">
+              <div><span class="op-badge badge-${h.action.toLowerCase()}">${h.action}</span> <strong>${escapeHtml(h.contract)} ${fmtNum(h.strike)}</strong> × ${h.lots}口 (${h.entryPrice} ➔ ${h.exitPrice})</div>
+              <strong style="color:${h.pnlNtd >= 0 ? '#f87171' : '#4ade80'}">${h.pnlNtd >= 0 ? '+' : ''}NT$ ${fmtNum(h.pnlNtd)}</strong>
+            </div>
+          `).join("")}
+        </div>
+      </div>
+    ` : ''}
+  `;
+
+  if (SIM_STATE.positions.length) {
+    drawSimPortfolioPayoff(settleMin, settleMax);
+  }
+}
+
+function drawSimPortfolioPayoff(minS, maxS) {
+  const canvas = document.getElementById("simPortfolioPayoffCanvas");
+  if (!canvas) return;
+  const ctx = canvas.getContext("2d");
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+
+  const pts = [];
+  for (let s = minS; s <= maxS; s += 50) {
+    pts.push({ s, pnl: calcTotalExpirationPnl(s) });
+  }
+  const maxAbs = Math.max(10000, ...pts.map(p => Math.abs(p.pnl))) * 1.15;
+  const padL = 68, padR = 24, padT = 16, padB = 26;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+  const xOf = s => padL + ((s - minS) / Math.max(1, maxS - minS)) * plotW;
+  const yOf = v => padT + plotH / 2 - (v / maxAbs) * (plotH / 2);
+
+  // Zero axis
+  ctx.strokeStyle = "rgba(250, 204, 21, 0.55)";
+  ctx.setLineDash([5, 4]);
+  ctx.beginPath(); ctx.moveTo(padL, yOf(0)); ctx.lineTo(padL + plotW, yOf(0)); ctx.stroke();
+  ctx.setLineDash([]);
+
+  // What-if vertical marker
+  const wx = xOf(SIM_FORM.whatIfSettle);
+  ctx.strokeStyle = "#fde047";
+  ctx.beginPath(); ctx.moveTo(wx, padT); ctx.lineTo(wx, padT + plotH); ctx.stroke();
+
+  // Curve
+  ctx.beginPath();
+  pts.forEach((p, i) => i === 0 ? ctx.moveTo(xOf(p.s), yOf(p.pnl)) : ctx.lineTo(xOf(p.s), yOf(p.pnl)));
+  ctx.strokeStyle = "#38bdf8";
+  ctx.lineWidth = 2.5;
+  ctx.stroke();
+
+  ctx.fillStyle = "#94a3b8";
+  ctx.font = "11px Consolas, monospace";
+  ctx.textAlign = "right";
+  ctx.fillText("+" + fmtNum(Math.round(maxAbs)), padL - 6, padT + 10);
+  ctx.fillText("0", padL - 6, yOf(0) + 4);
+  ctx.fillText("-" + fmtNum(Math.round(maxAbs)), padL - 6, padT + plotH);
+  ctx.textAlign = "center";
+  ctx.fillText(String(minS), padL, H - 6);
+  ctx.fillText(String(SIM_FORM.whatIfSettle), wx, H - 6);
+  ctx.fillText(String(maxS), padL + plotW, H - 6);
+}
+
+// ============================================================================
 // Tab 4: 盤勢分析報告與策略中心 (參照 op-win.com/ctlist.jsp)
 // ============================================================================
 function renderAnalysisTab() {
@@ -1745,9 +2135,38 @@ function renderAnalysisTab() {
 // Tab 5: 選擇權基礎教學與四大動作損益試算器 (參照 op-win.com/option.jsp)
 // ============================================================================
 function renderAcademyTab() {
+  const cfg = getSessionConfig();
+  const rep = cfg.analysisReport;
+  const chain = ACTIVE_CHAIN;
   const container = document.getElementById("tab-academy");
 
   container.innerHTML = `
+    <div class="panel-card">
+      <div class="panel-header">
+        <div>
+          <h2 class="section-h2">📑 台指盤勢與選擇權支撐壓力分析報告</h2>
+          <div style="font-size:0.78rem;color:var(--muted);margin-top:3px">結合期交所即時量能與選擇權支撐壓力區解讀</div>
+        </div>
+        <select class="select-input" onchange="onSessionChange(this.value)">
+          <option value="LIVE_TAIFEX" ${CURRENT_SESSION_ID === 'LIVE_TAIFEX' ? 'selected' : ''}>🟢 期交所即時連線分析</option>
+          ${MARKET_SESSIONS.map(s => `<option value="${s.id}" ${s.id === CURRENT_SESSION_ID ? 'selected' : ''}>${escapeHtml(s.label)}</option>`).join("")}
+        </select>
+      </div>
+      <div style="background:rgba(37,99,235,0.14);border:1px solid rgba(37,99,235,0.4);border-radius:12px;padding:14px;margin-bottom:12px">
+        <div style="font-size:1.02rem;font-weight:800;color:#fff">${escapeHtml(rep.headline)}</div>
+      </div>
+      <div class="advice-grid" style="margin-top:0">
+        <div class="advice-item">
+          <div style="color:#38bdf8;font-weight:700;margin-bottom:3px">📈 技術面與多空成本</div>
+          <div style="color:#cbd5e1">${escapeHtml(rep.techView)}</div>
+        </div>
+        <div class="advice-item">
+          <div style="color:#34d399;font-weight:700;margin-bottom:3px">🎯 選擇權籌碼結構</div>
+          <div style="color:#cbd5e1">${escapeHtml(rep.chipView)}</div>
+        </div>
+      </div>
+    </div>
+
     <div class="panel-card">
       <div class="panel-header">
         <h2 class="section-h2">📖 籌碼判讀實戰指南（看懂三線圖、T字壓力支撐牆與 P/C Ratio）</h2>
