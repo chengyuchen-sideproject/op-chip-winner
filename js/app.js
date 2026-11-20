@@ -98,13 +98,40 @@ function getSessionConfig() {
 }
 
 // ============================================================================
-// 1. Real-Time TAIFEX MIS API Client (Native Android Bridge / Local Proxy / CORS Fallback)
+// 1. Real-Time TAIFEX MIS API Client (Async Native Android Bridge / Proxy / CORS)
 // ============================================================================
+const __taifexPending = {};
+let __taifexReqSeq = 1;
+
+window.__onTaifexAsyncResult = function(reqId, ok, payload) {
+  const cb = __taifexPending[reqId];
+  if (!cb) return;
+  delete __taifexPending[reqId];
+  if (!ok) {
+    cb.reject(new Error(payload || "Network error"));
+    return;
+  }
+  try {
+    cb.resolve(JSON.parse(payload));
+  } catch (e) {
+    cb.reject(e);
+  }
+};
+
 async function taifexPost(endpoint, payloadObj) {
   const targetUrl = `https://mis.taifex.com.tw/futures/api/${endpoint}`;
   const bodyStr = JSON.stringify(payloadObj);
 
-  // Path A: Inside our Native Android APK (Zero CORS via Java HttpURLConnection bridge)
+  // Path A1: Non-blocking Async Native Android Bridge (does not freeze UI thread!)
+  if (window.TaifexNative && typeof window.TaifexNative.postJsonAsync === "function") {
+    return await new Promise((resolve, reject) => {
+      const reqId = String(__taifexReqSeq++);
+      __taifexPending[reqId] = { resolve, reject };
+      window.TaifexNative.postJsonAsync(reqId, targetUrl, bodyStr);
+    });
+  }
+
+  // Path A2: Legacy Sync Native Android Bridge fallback
   if (window.TaifexNative && typeof window.TaifexNative.postJson === "function") {
     const raw = window.TaifexNative.postJson(targetUrl, bodyStr);
     if (raw && !raw.startsWith("ERROR:")) {
@@ -266,10 +293,11 @@ async function fetchLiveTaifexData() {
       REPLAY_STEP = Math.max(0, REPLAY_BARS.length - 1);
     }
 
+    markAllTabsDirty();
     updateTickerBar();
-    if (CURRENT_TAB === "realtime") renderRealtimeTab();
-    else if (CURRENT_TAB === "strikes") renderStrikesTab();
-    else if (CURRENT_TAB === "analysis") renderAnalysisTab();
+    if (CURRENT_TAB === "realtime") { renderRealtimeTab(); TAB_DIRTY.realtime = false; }
+    else if (CURRENT_TAB === "strikes") { renderStrikesTab(); TAB_DIRTY.strikes = false; }
+    else if (CURRENT_TAB === "analysis") { renderAnalysisTab(); TAB_DIRTY.analysis = false; }
   } catch (err) {
     TAIFEX_STATUS.connected = false;
     TAIFEX_STATUS.errorMsg = err.message || String(err);
@@ -278,8 +306,9 @@ async function fetchLiveTaifexData() {
       ACTIVE_BARS = generateIntradaySeries(fallbackCfg, CURRENT_TIMEFRAME);
       ACTIVE_CHAIN = generateStrikeChain(fallbackCfg, CURRENT_CUM_DAYS);
     }
+    markAllTabsDirty();
     updateTickerBar();
-    if (CURRENT_TAB === "realtime") renderRealtimeTab();
+    if (CURRENT_TAB === "realtime") { renderRealtimeTab(); TAB_DIRTY.realtime = false; }
   }
 }
 
@@ -576,9 +605,20 @@ function updateTickerBar() {
 }
 
 // ============================================================================
-// Navigation
+// Navigation & Zero-Lag Tab Caching
 // ============================================================================
+const TAB_DIRTY = { realtime: true, strikes: true, replay: true, analysis: true, academy: true };
+
+function markAllTabsDirty() {
+  TAB_DIRTY.realtime = true;
+  TAB_DIRTY.strikes = true;
+  TAB_DIRTY.replay = true;
+  TAB_DIRTY.analysis = true;
+  // academy is static+interactive, only render once unless clicked
+}
+
 function switchView(tabId) {
+  if (CURRENT_TAB === tabId && !TAB_DIRTY[tabId]) return;
   CURRENT_TAB = tabId;
   document.querySelectorAll(".tab-view").forEach(v => {
     v.classList.toggle("active", v.id === "tab-" + tabId);
@@ -587,15 +627,19 @@ function switchView(tabId) {
     b.classList.toggle("active", b.dataset.tab === tabId);
   });
 
+  if (!TAB_DIRTY[tabId]) return;
+  TAB_DIRTY[tabId] = false;
+
   if (tabId === "realtime") renderRealtimeTab();
-  if (tabId === "strikes") renderStrikesTab();
-  if (tabId === "replay") renderReplayTab();
-  if (tabId === "analysis") renderAnalysisTab();
-  if (tabId === "academy") renderAcademyTab();
+  else if (tabId === "strikes") renderStrikesTab();
+  else if (tabId === "replay") renderReplayTab();
+  else if (tabId === "analysis") renderAnalysisTab();
+  else if (tabId === "academy") renderAcademyTab();
 }
 
 function onSessionChange(newSessionId) {
   CURRENT_SESSION_ID = newSessionId;
+  markAllTabsDirty();
   if (newSessionId === "LIVE_TAIFEX") {
     fetchLiveTaifexData();
     startTaifexAutoPoll();
@@ -603,6 +647,7 @@ function onSessionChange(newSessionId) {
     refreshSessionData();
     REPLAY_BARS = generateIntradaySeries(getSessionConfig(), REPLAY_TIMEFRAME);
     REPLAY_STEP = Math.min(REPLAY_BARS.length - 1, Math.max(10, Math.floor(REPLAY_BARS.length * 0.6)));
+    TAB_DIRTY[CURRENT_TAB] = true;
     switchView(CURRENT_TAB);
   }
 }
