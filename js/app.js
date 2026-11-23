@@ -1818,7 +1818,16 @@ function drawKlineWithCostCanvas(canvasId, bars, maxIdx) {
 const SIM_STORAGE_KEY = "op_chip_winner_sim_v1";
 let SIM_STATE = loadSimState();
 let SIM_FORM = { action: "BC", strike: 0, lots: 1, whatIfSettle: 0 };
-let SIM_AUTO_CONFIG = { enabled: true, tpPct: 25, slPct: 20, allocBudgetPct: 30, recWeights: [50, 30, 20] };
+let SIM_AUTO_CONFIG = {
+  enabled: true,
+  tpPct: 25,
+  slPct: 20,
+  trailingStop: true,
+  trailingArmPct: 15,
+  trailingPullbackPct: 8,
+  allocBudgetPct: 30,
+  recWeights: [50, 30, 20]
+};
 
 function getNormalizedRecWeights(count) {
   if (count <= 0) return [];
@@ -1910,6 +1919,10 @@ function buildWeeklyAllocationRecommendations() {
   const trendBonus = alignCount === 2 ? 8 : (alignCount === 1 ? 3 : -6);
   const alignLabel = alignCount === 2 ? "三線共振" : (alignCount === 1 ? "雙指標共振" : "籌碼分歧");
 
+  const now = new Date();
+  const isWedSettleDay = now.getDay() === 3 && now.getHours() >= 8 && now.getHours() < 14;
+  const isWedAfternoon = isWedSettleDay && now.getHours() >= 11;
+
   const scoreCandidate = (baseScore, volDiv, volCap, vol, bidSz, askSz, bidP, askP, price, strike, act, isHedge) => {
     const volScore = Math.min(volCap, Math.round(vol / volDiv));
     const bidAskBonus = bidSz >= askSz ? 8 : 4;
@@ -1933,11 +1946,23 @@ function buildWeeklyAllocationRecommendations() {
     } else if (act === "BP" && chain.putWall) {
       wallBonus = strike >= chain.putWall ? 3 : -6;
     }
+    let thetaBonus = 0;
+    let thetaTag = "";
+    const absDist = Math.abs(strike - atm);
+    if (isWedSettleDay) {
+      if (absDist >= 500) {
+        thetaBonus = isWedAfternoon ? -10 : -6;
+        thetaTag = "結算Theta衰減";
+      } else if (absDist <= 200) {
+        thetaBonus = 4;
+        thetaTag = "結算Gamma爆發";
+      }
+    }
     const dirBonus = isHedge ? (alignCount === 0 ? 6 : 0) : trendBonus;
-    const rawScore = baseScore + volScore + bidAskBonus + spreadBonus + wallBonus + dirBonus;
+    const rawScore = baseScore + volScore + bidAskBonus + spreadBonus + wallBonus + thetaBonus + dirBonus;
     return {
       score: Math.max(0, Math.min(96, Math.round(rawScore))),
-      metaTag: [alignLabel, spreadTag].filter(Boolean).join("・")
+      metaTag: [alignLabel, spreadTag, thetaTag].filter(Boolean).join("・")
     };
   };
 
@@ -2099,17 +2124,28 @@ function executeAutoRecommendedPortfolio() {
 function checkSimAutoTpSl() {
   if (!SIM_AUTO_CONFIG.enabled || !SIM_STATE.positions.length) return;
   const toClose = [];
+  let peakUpdated = false;
   SIM_STATE.positions.forEach(pos => {
-    const { curPrice, pnlNtd } = calcPosUnrealized(pos);
+    const { pnlNtd } = calcPosUnrealized(pos);
     const isBuyer = pos.action === "BC" || pos.action === "BP";
     const baseCapital = isBuyer ? Math.max(500, Math.round(pos.entryPrice * 50 * pos.lots)) : Math.max(35000, pos.marginLocked || 35000);
     const roiPct = (pnlNtd / baseCapital) * 100;
+    if (typeof pos.peakRoiPct !== "number" || roiPct > pos.peakRoiPct) {
+      pos.peakRoiPct = Math.round(roiPct * 10) / 10;
+      peakUpdated = true;
+    }
     if (roiPct >= SIM_AUTO_CONFIG.tpPct) {
       toClose.push({ id: pos.id, tag: `🎯 自動停利 (+${roiPct.toFixed(1)}%)` });
+    } else if (SIM_AUTO_CONFIG.trailingStop && pos.peakRoiPct >= SIM_AUTO_CONFIG.trailingArmPct) {
+      const trailFloor = Math.max(0, pos.peakRoiPct - SIM_AUTO_CONFIG.trailingPullbackPct);
+      if (roiPct <= trailFloor) {
+        toClose.push({ id: pos.id, tag: `📈 移動停利 (+${roiPct.toFixed(1)}%, 高點+${pos.peakRoiPct.toFixed(1)}%)` });
+      }
     } else if (roiPct <= -SIM_AUTO_CONFIG.slPct) {
       toClose.push({ id: pos.id, tag: `🛡️ 自動停損 (${roiPct.toFixed(1)}%)` });
     }
   });
+  if (peakUpdated && !toClose.length) saveSimState();
   if (toClose.length) {
     toClose.forEach(item => closeSimPosition(item.id, item.tag, true));
     SIM_LAST_AUTO_MSG = `⚡ 觸發自動風控：已自動平倉 ${toClose.length} 筆部位 (${toClose.map(x => x.tag).join("、")})`;
@@ -2399,6 +2435,9 @@ function renderSimTab() {
         <div class="btn-group">
           <button class="btn ${SIM_AUTO_CONFIG.enabled ? 'btn-teal' : ''}" onclick="SIM_AUTO_CONFIG.enabled=!SIM_AUTO_CONFIG.enabled;renderSimTab()">
             ${SIM_AUTO_CONFIG.enabled ? `⚡ 自動停利+${SIM_AUTO_CONFIG.tpPct}% / 停損-${SIM_AUTO_CONFIG.slPct}% (ON)` : '⏸️ 自動停利停損 (OFF)'}
+          </button>
+          <button class="btn ${SIM_AUTO_CONFIG.trailingStop ? 'btn-teal' : ''}" onclick="SIM_AUTO_CONFIG.trailingStop=!SIM_AUTO_CONFIG.trailingStop;renderSimTab()">
+            ${SIM_AUTO_CONFIG.trailingStop ? `📈 移動停利 +${SIM_AUTO_CONFIG.trailingArmPct}%保本 (ON)` : '📈 移動停利 (OFF)'}
           </button>
           <button class="btn btn-primary" onclick="executeAutoRecommendedPortfolio()">🚀 一鍵按推薦比例自動建倉</button>
         </div>
