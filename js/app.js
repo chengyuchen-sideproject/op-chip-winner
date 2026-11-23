@@ -1818,7 +1818,36 @@ function drawKlineWithCostCanvas(canvasId, bars, maxIdx) {
 const SIM_STORAGE_KEY = "op_chip_winner_sim_v1";
 let SIM_STATE = loadSimState();
 let SIM_FORM = { action: "BC", strike: 0, lots: 1, whatIfSettle: 0 };
-let SIM_AUTO_CONFIG = { enabled: true, tpPct: 25, slPct: 20, allocBudgetPct: 30 };
+let SIM_AUTO_CONFIG = { enabled: true, tpPct: 25, slPct: 20, allocBudgetPct: 30, recWeights: [50, 30, 20] };
+
+function getNormalizedRecWeights(count) {
+  if (count <= 0) return [];
+  if (count === 1) return [100];
+  const raw = (SIM_AUTO_CONFIG.recWeights || [50, 30, 20]).slice(0, count).map(w => Math.max(0, Number(w) || 0));
+  const total = raw.reduce((a, b) => a + b, 0);
+  if (total <= 0) {
+    const eq = Math.floor(100 / count);
+    const res = new Array(count).fill(eq);
+    res[0] += 100 - eq * count;
+    return res;
+  }
+  const norm = raw.map(w => Math.round((w / total) * 100));
+  const diff = 100 - norm.reduce((a, b) => a + b, 0);
+  norm[0] += diff;
+  return norm;
+}
+
+function setRecWeightAt(idx, val) {
+  if (!Array.isArray(SIM_AUTO_CONFIG.recWeights)) SIM_AUTO_CONFIG.recWeights = [50, 30, 20];
+  const n = Math.max(0, Math.min(100, Math.round(Number(val) || 0)));
+  SIM_AUTO_CONFIG.recWeights[idx] = n;
+  renderSimTab();
+}
+
+function applyRecWeightPreset(w0, w1, w2) {
+  SIM_AUTO_CONFIG.recWeights = [w0, w1, w2];
+  renderSimTab();
+}
 let SIM_LAST_AUTO_MSG = "";
 let SIM_EXPANDED_POS = new Set();
 let SIM_EXPANDED_HIST = new Set();
@@ -1873,7 +1902,44 @@ function buildWeeklyAllocationRecommendations() {
   const cVal = lastBar.callVal;
   const isBull = lastBar.cpDiffVal >= 0 && cVal >= 0;
   const mainAct = isBull ? "BC" : "BP";
-  const hedgeAct = isBull ? "BP" : "BC";
+
+  // Multi-factor chip consensus: CP diff + Major chip + VWAP mid cost
+  const majorAligned = isBull ? (lastBar.majorVal >= 0) : (lastBar.majorVal <= 0);
+  const vwapAligned = isBull ? (lastBar.close >= lastBar.greenMidCost) : (lastBar.close <= lastBar.greenMidCost);
+  const alignCount = (majorAligned ? 1 : 0) + (vwapAligned ? 1 : 0);
+  const trendBonus = alignCount === 2 ? 8 : (alignCount === 1 ? 3 : -6);
+  const alignLabel = alignCount === 2 ? "三線共振" : (alignCount === 1 ? "雙指標共振" : "籌碼分歧");
+
+  const scoreCandidate = (baseScore, volDiv, volCap, vol, bidSz, askSz, bidP, askP, price, strike, act, isHedge) => {
+    const volScore = Math.min(volCap, Math.round(vol / volDiv));
+    const bidAskBonus = bidSz >= askSz ? 8 : 4;
+    let spreadBonus = 0;
+    let spreadTag = "";
+    if (bidP > 0 && askP > 0 && price > 0) {
+      const spreadPct = ((askP - bidP) / price) * 100;
+      if (spreadPct <= 3) {
+        spreadBonus = 4;
+        spreadTag = `滑價低 ${spreadPct.toFixed(1)}%`;
+      } else if (spreadPct > 10) {
+        spreadBonus = -10;
+        spreadTag = `滑價偏高 ${spreadPct.toFixed(1)}%`;
+      } else {
+        spreadTag = `價差 ${spreadPct.toFixed(1)}%`;
+      }
+    }
+    let wallBonus = 0;
+    if (act === "BC" && chain.callWall) {
+      wallBonus = strike <= chain.callWall ? 3 : -6;
+    } else if (act === "BP" && chain.putWall) {
+      wallBonus = strike >= chain.putWall ? 3 : -6;
+    }
+    const dirBonus = isHedge ? (alignCount === 0 ? 6 : 0) : trendBonus;
+    const rawScore = baseScore + volScore + bidAskBonus + spreadBonus + wallBonus + dirBonus;
+    return {
+      score: Math.max(0, Math.min(96, Math.round(rawScore))),
+      metaTag: [alignLabel, spreadTag].filter(Boolean).join("・")
+    };
+  };
 
   // Buyer-Only Strategy (100% BC & BP, zero unlimited seller risk)
   const coreCandidates = [];
@@ -1885,65 +1951,63 @@ function buildWeeklyAllocationRecommendations() {
     if (mainAct === "BP") {
       // Core BP: ATM to -300 OTM (High Delta)
       if (s.putPrice >= 30 && s.putPrice <= 2200 && dist <= 100 && dist >= -300 && (s.putVol > 0 || s.putOi > 0)) {
-        const volScore = Math.min(30, Math.round(s.putVol / 50));
-        const bidAskBonus = s.putBid >= s.putAsk ? 10 : 5;
+        const sc = scoreCandidate(48, 50, 30, s.putVol, s.putBid, s.putAsk, s.putBidP, s.putAskP, s.putPrice, s.strike, "BP", false);
         coreCandidates.push({
           strike: s.strike, cp: "P", action: "BP", price: s.putPrice, vol: s.putVol, oi: s.putOi,
-          winScore: Math.min(94, 52 + volScore + bidAskBonus),
+          winScore: sc.score,
           role: "🔥 1. 核心順勢買方 (近價平)",
-          reason: `空方主導 (${dist}點)，貼近價平高 Delta、成交量 ${fmtNum(s.putVol)} 口`
+          reason: `空方主導 (${dist}點)，${sc.metaTag}，成交量 ${fmtNum(s.putVol)} 口`
         });
       }
-      // Leverage BP: -400 to -900 OTM (Lower premium, high Gamma leverage)
+      // Leverage BP: -400 to -1000 OTM (Lower premium, high Gamma leverage)
       if (s.putPrice >= 15 && s.putPrice <= 1200 && dist <= -400 && dist >= -1000 && (s.putVol > 0 || s.putOi > 0)) {
-        const volScore = Math.min(28, Math.round(s.putVol / 40));
+        const sc = scoreCandidate(45, 40, 28, s.putVol, s.putBid, s.putAsk, s.putBidP, s.putAskP, s.putPrice, s.strike, "BP", false);
         leverageCandidates.push({
           strike: s.strike, cp: "P", action: "BP", price: s.putPrice, vol: s.putVol, oi: s.putOi,
-          winScore: Math.min(90, 48 + volScore),
+          winScore: sc.score,
           role: "⚡ 2. 高槓桿波段買方 (價外)",
-          reason: `權利金成本較低 (${dist}點)，遇急殺時報酬率放大最快`
+          reason: `權利金成本較低 (${dist}點)，${sc.metaTag}，急殺放大快`
         });
       }
-      // Hedge BC: +200 to +700 OTM (Cheap reversal protection)
+      // Hedge BC: +200 to +800 OTM (Cheap reversal protection)
       if (s.callPrice >= 15 && s.callPrice <= 900 && dist >= 200 && dist <= 800 && (s.callVol > 0 || s.callOi > 0)) {
-        const volScore = Math.min(25, Math.round(s.callVol / 40));
+        const sc = scoreCandidate(43, 40, 25, s.callVol, s.callBid, s.callAsk, s.callBidP, s.callAskP, s.callPrice, s.strike, "BC", true);
         hedgeCandidates.push({
           strike: s.strike, cp: "C", action: "BC", price: s.callPrice, vol: s.callVol, oi: s.callOi,
-          winScore: Math.min(85, 44 + volScore),
+          winScore: sc.score,
           role: "🛡️ 3. 買方反轉保護單 (BC避險)",
-          reason: `低成本佈局防軋空反轉 (+${dist}點)，形成買方勒式保護`
+          reason: `防軋空反轉 (+${dist}點)，${sc.metaTag}，買方勒式保護`
         });
       }
     } else {
       // Core BC: ATM to +300 OTM
       if (s.callPrice >= 30 && s.callPrice <= 2200 && dist >= -100 && dist <= 300 && (s.callVol > 0 || s.callOi > 0)) {
-        const volScore = Math.min(30, Math.round(s.callVol / 50));
-        const bidAskBonus = s.callBid >= s.callAsk ? 10 : 5;
+        const sc = scoreCandidate(48, 50, 30, s.callVol, s.callBid, s.callAsk, s.callBidP, s.callAskP, s.callPrice, s.strike, "BC", false);
         coreCandidates.push({
           strike: s.strike, cp: "C", action: "BC", price: s.callPrice, vol: s.callVol, oi: s.callOi,
-          winScore: Math.min(94, 52 + volScore + bidAskBonus),
+          winScore: sc.score,
           role: "🔥 1. 核心順勢買方 (近價平)",
-          reason: `多方主導 (+${dist}點)，貼近價平高 Delta、成交量 ${fmtNum(s.callVol)} 口`
+          reason: `多方主導 (+${dist}點)，${sc.metaTag}，成交量 ${fmtNum(s.callVol)} 口`
         });
       }
       // Leverage BC: +400 to +1000 OTM
       if (s.callPrice >= 15 && s.callPrice <= 1200 && dist >= 400 && dist <= 1000 && (s.callVol > 0 || s.callOi > 0)) {
-        const volScore = Math.min(28, Math.round(s.callVol / 40));
+        const sc = scoreCandidate(45, 40, 28, s.callVol, s.callBid, s.callAsk, s.callBidP, s.callAskP, s.callPrice, s.strike, "BC", false);
         leverageCandidates.push({
           strike: s.strike, cp: "C", action: "BC", price: s.callPrice, vol: s.callVol, oi: s.callOi,
-          winScore: Math.min(90, 48 + volScore),
+          winScore: sc.score,
           role: "⚡ 2. 高槓桿波段買方 (價外)",
-          reason: `權利金成本較低 (+${dist}點)，突破上攻時報酬率放大最快`
+          reason: `權利金成本較低 (+${dist}點)，${sc.metaTag}，突破放大快`
         });
       }
       // Hedge BP: -200 to -800 OTM
       if (s.putPrice >= 15 && s.putPrice <= 900 && dist <= -200 && dist >= -800 && (s.putVol > 0 || s.putOi > 0)) {
-        const volScore = Math.min(25, Math.round(s.putVol / 40));
+        const sc = scoreCandidate(43, 40, 25, s.putVol, s.putBid, s.putAsk, s.putBidP, s.putAskP, s.putPrice, s.strike, "BP", true);
         hedgeCandidates.push({
           strike: s.strike, cp: "P", action: "BP", price: s.putPrice, vol: s.putVol, oi: s.putOi,
-          winScore: Math.min(85, 44 + volScore),
+          winScore: sc.score,
           role: "🛡️ 3. 買方反轉保護單 (BP避險)",
-          reason: `低成本防急殺回測 (${dist}點)，形成買方勒式保護`
+          reason: `防急殺回測 (${dist}點)，${sc.metaTag}，買方勒式保護`
         });
       }
     }
@@ -1981,8 +2045,8 @@ function buildWeeklyAllocationRecommendations() {
 
   if (!picked.length) return [];
 
-  // Assign percentage weights summing to 100%
-  const weightProfiles = picked.length === 3 ? [50, 30, 20] : (picked.length === 2 ? [60, 40] : [100]);
+  // Assign adjustable percentage weights normalized to 100%
+  const weightProfiles = getNormalizedRecWeights(picked.length);
   const deployBudget = Math.max(20000, Math.round(SIM_STATE.cash * (SIM_AUTO_CONFIG.allocBudgetPct / 100)));
   const tpPct = SIM_AUTO_CONFIG.tpPct;
   const slPct = SIM_AUTO_CONFIG.slPct;
@@ -2362,6 +2426,23 @@ function renderSimTab() {
               <option value="20" ${SIM_AUTO_CONFIG.slPct===20?'selected':''}>停損 -20%</option>
               <option value="30" ${SIM_AUTO_CONFIG.slPct===30?'selected':''}>停損 -30%</option>
             </select>
+          </div>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:6px">
+          <span style="font-weight:700;color:#e2e8f0">推薦清單配置比例 (%)：</span>
+          <div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center">
+            ${[0, 1, 2].map(i => `
+              <label style="display:inline-flex;align-items:center;gap:3px;font-size:0.72rem;color:#cbd5e1">
+                <span>第${i + 1}檔</span>
+                <input type="number" min="0" max="100" step="5"
+                  value="${(SIM_AUTO_CONFIG.recWeights || [50, 30, 20])[i] ?? 0}"
+                  onchange="setRecWeightAt(${i}, this.value)"
+                  style="width:48px;padding:3px 5px;border-radius:6px;border:1px solid var(--border);background:#0f172a;color:#38bdf8;font-weight:700;text-align:center;font-size:0.74rem" />%
+              </label>
+            `).join("")}
+            <button class="btn" style="padding:3px 7px;font-size:0.7rem" onclick="applyRecWeightPreset(50,30,20)">50/30/20</button>
+            <button class="btn" style="padding:3px 7px;font-size:0.7rem" onclick="applyRecWeightPreset(70,20,10)">70/20/10</button>
+            <button class="btn" style="padding:3px 7px;font-size:0.7rem" onclick="applyRecWeightPreset(34,33,33)">均分</button>
           </div>
         </div>
       </div>
