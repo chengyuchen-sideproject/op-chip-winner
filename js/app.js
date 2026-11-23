@@ -1953,10 +1953,11 @@ function buildWeeklyAllocationRecommendations() {
   leverageCandidates.sort((a, b) => b.winScore - a.winScore);
   hedgeCandidates.sort((a, b) => b.winScore - a.winScore);
 
+  const MIN_CONFIDENCE = 80;
   const picked = [];
   const usedKeys = new Set();
   const pushUnique = (item) => {
-    if (!item) return;
+    if (!item || item.winScore < MIN_CONFIDENCE) return;
     const key = `${item.strike}_${item.action}`;
     if (!usedKeys.has(key)) {
       usedKeys.add(key);
@@ -1964,38 +1965,27 @@ function buildWeeklyAllocationRecommendations() {
     }
   };
 
-  pushUnique(coreCandidates[0]);
-  pushUnique(leverageCandidates[0]);
-  pushUnique(hedgeCandidates[0]);
+  pushUnique(coreCandidates.find(x => x.winScore >= MIN_CONFIDENCE));
+  pushUnique(leverageCandidates.find(x => x.winScore >= MIN_CONFIDENCE));
+  pushUnique(hedgeCandidates.find(x => x.winScore >= MIN_CONFIDENCE));
 
-  // Fallback to ensure Top 3 pure BC/BP picks
-  if (picked.length < 3 && chain.strikes.length) {
-    const midIdx = Math.max(0, chain.strikes.findIndex(x => x.isAtm));
-    const offsets = isBull ? [0, 2, -2, 1, 3, -1] : [0, -2, 2, -1, -3, 1];
-    for (let k = 0; k < offsets.length && picked.length < 3; k++) {
-      const row = chain.strikes[midIdx + offsets[k]];
-      if (!row) continue;
-      const act = (offsets[k] * (isBull ? 1 : -1) < 0) ? hedgeAct : mainAct;
-      const cp = act === "BC" ? "C" : "P";
-      const price = cp === "C" ? row.callPrice : row.putPrice;
-      const key = `${row.strike}_${act}`;
-      if (price > 0 && !usedKeys.has(key)) {
-        usedKeys.add(key);
-        picked.push({
-          strike: row.strike, cp, action: act, price,
-          vol: cp === "C" ? row.callVol : row.putVol,
-          oi: cp === "C" ? row.callOi : row.putOi,
-          winScore: 76 - k * 2,
-          role: act === mainAct ? "⚡ 順勢買方部位" : "🛡️ 買方避險保護",
-          reason: `純買方 (風險僅限權利金)，成交量 ${fmtNum(cp === "C" ? row.callVol : row.putVol)} 口`
-        });
-      }
+  // If fewer than 3 picks reached 80% across categories, fill remaining slots from other >=80% candidates
+  if (picked.length < 3) {
+    const allHighConf = [...coreCandidates, ...leverageCandidates, ...hedgeCandidates]
+      .filter(x => x.winScore >= MIN_CONFIDENCE)
+      .sort((a, b) => b.winScore - a.winScore);
+    for (let i = 0; i < allHighConf.length && picked.length < 3; i++) {
+      pushUnique(allHighConf[i]);
     }
   }
+
+  if (!picked.length) return [];
 
   // Assign percentage weights summing to 100%
   const weightProfiles = picked.length === 3 ? [50, 30, 20] : (picked.length === 2 ? [60, 40] : [100]);
   const deployBudget = Math.max(20000, Math.round(SIM_STATE.cash * (SIM_AUTO_CONFIG.allocBudgetPct / 100)));
+  const tpPct = SIM_AUTO_CONFIG.tpPct;
+  const slPct = SIM_AUTO_CONFIG.slPct;
 
   return picked.map((p, idx) => {
     const pct = weightProfiles[idx];
@@ -2003,11 +1993,22 @@ function buildWeeklyAllocationRecommendations() {
     const isBuy = p.action === "BC" || p.action === "BP";
     const costPerLot = isBuy ? Math.max(500, Math.round(p.price * 50)) : 35000;
     const suggestedLots = Math.max(1, Math.min(5, Math.floor(allocNtd / costPerLot) || 1));
+    const tpPrice = isBuy
+      ? Math.round(p.price * (1 + tpPct / 100) * 10) / 10
+      : Math.max(0.5, Math.round(p.price * (1 - tpPct / 100) * 10) / 10);
+    const slPrice = isBuy
+      ? Math.max(0.5, Math.round(p.price * (1 - slPct / 100) * 10) / 10)
+      : Math.round(p.price * (1 + slPct / 100) * 10) / 10;
     return {
       ...p,
+      confidence: p.winScore,
       pct,
       allocNtd,
-      suggestedLots
+      suggestedLots,
+      tpPrice,
+      slPrice,
+      tpPct,
+      slPct
     };
   });
 }
@@ -2015,7 +2016,7 @@ function buildWeeklyAllocationRecommendations() {
 function executeAutoRecommendedPortfolio() {
   const recs = buildWeeklyAllocationRecommendations();
   if (!recs.length) {
-    alert("目前尚無足夠的週選報價進行推薦下單！");
+    alert("目前尚無信心度 80% 以上的週選推薦標的！");
     return;
   }
   let placed = 0;
@@ -2329,7 +2330,7 @@ function renderSimTab() {
       <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">
         <div>
           <div style="font-size:1rem;font-weight:800;color:#fff">🤖 週選百分比購買推薦 & 自動化模擬操盤（目標合約：${escapeHtml(TAIFEX_EXPIRE_MONTH || '近週選')}）</div>
-          <div style="font-size:0.76rem;color:#cbd5e1;margin-top:2px">依即時 CP 差額、VWAP 成本與 OI 壓力支撐牆，自動篩選高勝率履約價並配置購買百分比</div>
+          <div style="font-size:0.76rem;color:#cbd5e1;margin-top:2px">依即時 CP 差額、VWAP 成本與 OI 壓力支撐牆，僅挑選<strong>信心度 ≥ 80%</strong> 標的並標示建議停損/停利價格</div>
         </div>
         <div class="btn-group">
           <button class="btn ${SIM_AUTO_CONFIG.enabled ? 'btn-teal' : ''}" onclick="SIM_AUTO_CONFIG.enabled=!SIM_AUTO_CONFIG.enabled;renderSimTab()">
@@ -2366,25 +2367,36 @@ function renderSimTab() {
       </div>
 
       <div class="advice-grid">
-        ${recs.map(r => `
+        ${recs.length ? recs.map(r => `
           <div class="advice-item" style="border-color:rgba(56,189,248,0.35)">
-            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;gap:4px;flex-wrap:wrap">
               <span style="font-size:0.78rem;font-weight:800;color:#fde047">${escapeHtml(r.role)}</span>
-              <span class="op-badge badge-bc" style="background:rgba(56,189,248,0.2);color:#38bdf8;border-color:#38bdf8">推薦配置 ${r.pct}%</span>
+              <div style="display:flex;gap:4px;align-items:center">
+                <span class="op-badge" style="background:rgba(16,185,129,0.2);color:#34d399;border-color:#10b981">信心度 ${r.confidence}%</span>
+                <span class="op-badge badge-bc" style="background:rgba(56,189,248,0.2);color:#38bdf8;border-color:#38bdf8">配置 ${r.pct}%</span>
+              </div>
             </div>
             <div style="font-size:0.98rem;font-weight:800;color:#fff;margin-bottom:3px">
               <span class="op-badge badge-${r.action.toLowerCase()}">${r.action}</span>
               ${fmtNum(r.strike)} ${r.cp === 'C' ? 'Call' : 'Put'} @ <strong style="color:#fde047">${r.price.toFixed(1)}</strong>
             </div>
             <div style="font-size:0.75rem;color:#34d399;margin-bottom:4px">
-              勝率評分：<strong>${r.winScore} 分</strong> ｜ 建議買賣：<strong>${r.suggestedLots} 口</strong> (約 NT$ ${fmtNum(r.allocNtd)})
+              建議買賣：<strong>${r.suggestedLots} 口</strong> (約 NT$ ${fmtNum(r.allocNtd)})
+            </div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;font-size:0.74rem;margin-bottom:6px;padding:4px 8px;border-radius:6px;background:rgba(15,23,42,0.75);border:1px solid rgba(148,163,184,0.2)">
+              <span style="color:#f87171">🎯 建議停利：<strong>${r.tpPrice.toFixed(1)} 點</strong> (+${r.tpPct}%)</span>
+              <span style="color:#4ade80">🛡️ 建議停損：<strong>${r.slPrice.toFixed(1)} 點</strong> (-${r.slPct}%)</span>
             </div>
             <div style="font-size:0.74rem;color:var(--muted);margin-bottom:8px">${escapeHtml(r.reason)}</div>
             <button class="btn" style="width:100%;justify-content:center;padding:5px;font-size:0.76rem" onclick="placeSimOrder(${r.strike},'${r.action}',${r.suggestedLots})">
               ⚡ 單筆下單 (${r.action} ${r.suggestedLots}口)
             </button>
           </div>
-        `).join("")}
+        `).join("") : `
+          <div style="grid-column:1/-1;padding:16px;text-align:center;color:var(--muted);font-size:0.84rem;background:rgba(15,23,42,0.5);border:1px dashed var(--border);border-radius:10px">
+            ⏳ 目前尚無信心度達 <strong>80% 以上</strong> 的週選推薦標的（建議觀望或等待盤中量能放大）。
+          </div>
+        `}
       </div>
     </div>
 
