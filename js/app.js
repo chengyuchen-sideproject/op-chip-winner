@@ -133,7 +133,16 @@ async function taifexPost(endpoint, payloadObj) {
     TAIFEX_STATUS.transportMode = "📱 Android 原生直連 (TaifexNative Async)";
     return await new Promise((resolve, reject) => {
       const reqId = String(__taifexReqSeq++);
-      __taifexPending[reqId] = { resolve, reject };
+      const timer = setTimeout(() => {
+        if (__taifexPending[reqId]) {
+          delete __taifexPending[reqId];
+          reject(new Error("TaifexNative Async timeout (12s)"));
+        }
+      }, 12000);
+      __taifexPending[reqId] = {
+        resolve: (val) => { clearTimeout(timer); resolve(val); },
+        reject: (err) => { clearTimeout(timer); reject(err); }
+      };
       window.TaifexNative.postJsonAsync(reqId, targetUrl, bodyStr);
     });
   }
@@ -223,8 +232,15 @@ document.addEventListener("change", (e) => {
   }
 });
 
+let TAIFEX_IS_FETCHING = false;
+let TAIFEX_DDL_CACHE = { marketType: "", epoch: 0, months: [] };
+let TAIFEX_DAY_OI_CACHE = { contract: "", epoch: 0, map: {} };
+const LIVE_CHIP_SNAPSHOTS = [];
+
 async function fetchLiveTaifexData() {
   if (CURRENT_SESSION_ID !== "LIVE_TAIFEX") return;
+  if (TAIFEX_IS_FETCHING) return;
+  TAIFEX_IS_FETCHING = true;
   try {
     // Step 1: Decide MarketType (0 = 日盤 08:45~13:45, 1 = 夜盤 15:00~05:00)
     const nowHour = new Date().getHours();
@@ -293,21 +309,27 @@ async function fetchLiveTaifexData() {
 
     PAYOFF_STRIKE = Math.round(txfPrice / 100) * 100;
 
-    // Step 3: Fetch Available Option Contract Months (if not yet fetched)
-    const ddlResp = await taifexPost("getCmdyMonthDDLItemByKind", {
-      MarketType: mType, SymbolType: "O", KindID: "1", CID: "TXO"
-    });
-    const rawMonths = ((ddlResp && ddlResp.RtData && ddlResp.RtData.Items) || [])
-      .map(x => x.item)
-      .filter(m => m && /^[0-9]{6}/.test(m));
-    if (rawMonths.length) {
-      TAIFEX_AVAILABLE_MONTHS = rawMonths;
-      if (!TAIFEX_EXPIRE_MONTH || rawMonths.indexOf(TAIFEX_EXPIRE_MONTH) === -1) {
-        TAIFEX_EXPIRE_MONTH = rawMonths[0];
+    // Step 3: Fetch Available Option Contract Months (cached for 5 minutes per MarketType)
+    const nowMs = Date.now();
+    if (TAIFEX_DDL_CACHE.marketType !== mType || !TAIFEX_DDL_CACHE.months.length || (nowMs - TAIFEX_DDL_CACHE.epoch) > 300000) {
+      const ddlResp = await taifexPost("getCmdyMonthDDLItemByKind", {
+        MarketType: mType, SymbolType: "O", KindID: "1", CID: "TXO"
+      });
+      const rawMonths = ((ddlResp && ddlResp.RtData && ddlResp.RtData.Items) || [])
+        .map(x => x.item)
+        .filter(m => m && /^[0-9]{6}/.test(m));
+      if (rawMonths.length) {
+        TAIFEX_DDL_CACHE = { marketType: mType, epoch: nowMs, months: rawMonths };
+      }
+    }
+    if (TAIFEX_DDL_CACHE.months.length) {
+      TAIFEX_AVAILABLE_MONTHS = TAIFEX_DDL_CACHE.months;
+      if (!TAIFEX_EXPIRE_MONTH || TAIFEX_AVAILABLE_MONTHS.indexOf(TAIFEX_EXPIRE_MONTH) === -1) {
+        TAIFEX_EXPIRE_MONTH = TAIFEX_AVAILABLE_MONTHS[0];
       }
     }
 
-    // Step 4: Fetch Options T-Quote Chain (both Day Session for OpenInterest and Active Session for Live Prices)
+    // Step 4: Fetch Options T-Quote Chain (Active Session for Live Prices; Day Session OI cached 3 min during Night Session)
     const optActiveResp = await taifexPost("getQuoteListOption", {
       MarketType: mType, SymbolType: "O", KindID: "1", CID: "TXO",
       ExpireMonth: TAIFEX_EXPIRE_MONTH, RowSize: "全部", PageNo: "", SortColumn: "", AscDesc: "A"
@@ -316,23 +338,40 @@ async function fetchLiveTaifexData() {
 
     let dayOiMap = {};
     if (mType === "1") {
-      try {
-        const optDayResp = await taifexPost("getQuoteListOption", {
-          MarketType: "0", SymbolType: "O", KindID: "1", CID: "TXO",
-          ExpireMonth: TAIFEX_EXPIRE_MONTH, RowSize: "全部", PageNo: "", SortColumn: "", AscDesc: "A"
-        });
-        const dayOptList = (optDayResp && optDayResp.RtData && optDayResp.RtData.QuoteList) || [];
-        dayOptList.forEach(o => {
-          const k = `${Math.round(Number(o.StrikePrice))}_${o.CP}`;
-          dayOiMap[k] = Number(o.OpenInterest || 0);
-        });
-      } catch (e) {}
+      if (TAIFEX_DAY_OI_CACHE.contract === TAIFEX_EXPIRE_MONTH && (nowMs - TAIFEX_DAY_OI_CACHE.epoch) < 180000 && Object.keys(TAIFEX_DAY_OI_CACHE.map).length) {
+        dayOiMap = TAIFEX_DAY_OI_CACHE.map;
+      } else {
+        try {
+          const optDayResp = await taifexPost("getQuoteListOption", {
+            MarketType: "0", SymbolType: "O", KindID: "1", CID: "TXO",
+            ExpireMonth: TAIFEX_EXPIRE_MONTH, RowSize: "全部", PageNo: "", SortColumn: "", AscDesc: "A"
+          });
+          const dayOptList = (optDayResp && optDayResp.RtData && optDayResp.RtData.QuoteList) || [];
+          dayOptList.forEach(o => {
+            const k = `${Math.round(Number(o.StrikePrice))}_${o.CP}`;
+            dayOiMap[k] = Number(o.OpenInterest || 0);
+          });
+          if (Object.keys(dayOiMap).length) {
+            TAIFEX_DAY_OI_CACHE = { contract: TAIFEX_EXPIRE_MONTH, epoch: nowMs, map: dayOiMap };
+          }
+        } catch (e) {}
+      }
     }
 
     // Build Live Strike Chain & Net Call/Put Option Force
     TAIFEX_STATUS.optionCount = activeOptList.length;
     const BuiltChain = buildLiveStrikeChainFromTaifex(activeOptList, dayOiMap, txfPrice, TAIFEX_EXPIRE_MONTH);
     ACTIVE_CHAIN = BuiltChain;
+
+    // Record real live cross-sectional chip snapshot for true delta verification
+    LIVE_CHIP_SNAPSHOTS.push({
+      epoch: nowMs,
+      cpDiff: BuiltChain.totalCallNetForce - BuiltChain.totalPutNetForce,
+      callNet: BuiltChain.totalCallNetForce,
+      putNet: BuiltChain.totalPutNetForce,
+      txfPrice
+    });
+    if (LIVE_CHIP_SNAPSHOTS.length > 30) LIVE_CHIP_SNAPSHOTS.shift();
 
     // Build Live Intraday 1m / 5m / 15m Bars & 3-Mode Chip Lines from TAIFEX 1M Ticks
     ACTIVE_BARS = buildLiveBarsFromTaifexTicks(rawTicks, CURRENT_TIMEFRAME, BuiltChain, TAIFEX_STATUS);
@@ -365,6 +404,8 @@ async function fetchLiveTaifexData() {
     markAllTabsDirty();
     updateTickerBar();
     if (!isUserInteractingWithForm() && CURRENT_TAB === "realtime") { renderRealtimeTab(); TAB_DIRTY.realtime = false; }
+  } finally {
+    TAIFEX_IS_FETCHING = false;
   }
 }
 
@@ -645,7 +686,12 @@ function refreshSessionData() {
   const cfg = getSessionConfig();
   ACTIVE_BARS = generateIntradaySeries(cfg, CURRENT_TIMEFRAME);
   ACTIVE_CHAIN = generateStrikeChain(cfg, CURRENT_CUM_DAYS);
+  markAllTabsDirty();
   updateTickerBar();
+  if (CURRENT_TAB === "realtime") { renderRealtimeTab(); TAB_DIRTY.realtime = false; }
+  else if (CURRENT_TAB === "strikes") { renderStrikesTab(); TAB_DIRTY.strikes = false; }
+  else if (CURRENT_TAB === "sim") { renderSimTab(); TAB_DIRTY.sim = false; }
+  else if (CURRENT_TAB === "academy") { renderAcademyTab(); TAB_DIRTY.academy = false; }
 }
 
 function updateTickerBar() {
@@ -1909,6 +1955,9 @@ function buildWeeklyAllocationRecommendations() {
 
   const atm = chain.atmStrike;
   const cVal = lastBar.callVal;
+  const pVal = lastBar.putVal;
+  // Detect Seller Range-Pin Regime (SC + SP: both Call and Put below zero axis)
+  const isDoubleSellRange = cVal < 0 && pVal < 0;
   const isBull = lastBar.cpDiffVal >= 0 && cVal >= 0;
   const mainAct = isBull ? "BC" : "BP";
 
@@ -1916,14 +1965,33 @@ function buildWeeklyAllocationRecommendations() {
   const majorAligned = isBull ? (lastBar.majorVal >= 0) : (lastBar.majorVal <= 0);
   const vwapAligned = isBull ? (lastBar.close >= lastBar.greenMidCost) : (lastBar.close <= lastBar.greenMidCost);
   const alignCount = (majorAligned ? 1 : 0) + (vwapAligned ? 1 : 0);
-  const trendBonus = alignCount === 2 ? 8 : (alignCount === 1 ? 3 : -6);
-  const alignLabel = alignCount === 2 ? "三線共振" : (alignCount === 1 ? "雙指標共振" : "籌碼分歧");
+
+  // Short-term momentum slope check (last 3 bars + real live snapshot delta if available)
+  const prevBar = ACTIVE_BARS[Math.max(0, ACTIVE_BARS.length - 4)] || lastBar;
+  const barCpSlope = lastBar.cpDiffVal - prevBar.cpDiffVal;
+  let momentumAligned = isBull ? (barCpSlope >= 0) : (barCpSlope <= 0);
+  if (CURRENT_SESSION_ID === "LIVE_TAIFEX" && LIVE_CHIP_SNAPSHOTS.length >= 2) {
+    const firstSnap = LIVE_CHIP_SNAPSHOTS[Math.max(0, LIVE_CHIP_SNAPSHOTS.length - 4)];
+    const lastSnap = LIVE_CHIP_SNAPSHOTS[LIVE_CHIP_SNAPSHOTS.length - 1];
+    const snapDelta = lastSnap.cpDiff - firstSnap.cpDiff;
+    if (snapDelta !== 0) {
+      momentumAligned = isBull ? (snapDelta > 0) : (snapDelta < 0);
+    }
+  }
+  const momentumBonus = isDoubleSellRange ? -8 : (momentumAligned ? 3 : -5);
+  const trendBonus = (alignCount === 2 ? 8 : (alignCount === 1 ? 3 : -6)) + momentumBonus;
+  const alignLabel = isDoubleSellRange
+    ? "雙賣盤整慎追"
+    : `${alignCount === 2 ? "三線共振" : (alignCount === 1 ? "雙指標共振" : "籌碼分歧")}(${momentumAligned ? "動能加速" : "動能轉弱"})`;
 
   const now = new Date();
   const isWedSettleDay = now.getDay() === 3 && now.getHours() >= 8 && now.getHours() < 14;
   const isWedAfternoon = isWedSettleDay && now.getHours() >= 11;
 
   const scoreCandidate = (baseScore, volDiv, volCap, vol, bidSz, askSz, bidP, askP, price, strike, act, isHedge) => {
+    if (vol < 10) {
+      return { score: 0, metaTag: "成交量不足" };
+    }
     const volScore = Math.min(volCap, Math.round(vol / volDiv));
     const bidAskBonus = bidSz >= askSz ? 8 : 4;
     let spreadBonus = 0;
@@ -1933,18 +2001,18 @@ function buildWeeklyAllocationRecommendations() {
       if (spreadPct <= 3) {
         spreadBonus = 4;
         spreadTag = `滑價低 ${spreadPct.toFixed(1)}%`;
-      } else if (spreadPct > 10) {
-        spreadBonus = -10;
+      } else if (spreadPct > 8) {
+        spreadBonus = -12;
         spreadTag = `滑價偏高 ${spreadPct.toFixed(1)}%`;
       } else {
         spreadTag = `價差 ${spreadPct.toFixed(1)}%`;
       }
     }
     let wallBonus = 0;
-    if (act === "BC" && chain.callWall) {
-      wallBonus = strike <= chain.callWall ? 3 : -6;
-    } else if (act === "BP" && chain.putWall) {
-      wallBonus = strike >= chain.putWall ? 3 : -6;
+    if (act === "BC" && chain.callWallStrike) {
+      wallBonus = strike <= chain.callWallStrike ? 3 : -6;
+    } else if (act === "BP" && chain.putWallStrike) {
+      wallBonus = strike >= chain.putWallStrike ? 3 : -6;
     }
     let thetaBonus = 0;
     let thetaTag = "";
@@ -1958,7 +2026,7 @@ function buildWeeklyAllocationRecommendations() {
         thetaTag = "結算Gamma爆發";
       }
     }
-    const dirBonus = isHedge ? (alignCount === 0 ? 6 : 0) : trendBonus;
+    const dirBonus = isHedge ? (alignCount === 0 && !isDoubleSellRange ? 6 : -4) : trendBonus;
     const rawScore = baseScore + volScore + bidAskBonus + spreadBonus + wallBonus + thetaBonus + dirBonus;
     return {
       score: Math.max(0, Math.min(96, Math.round(rawScore))),
@@ -2171,6 +2239,7 @@ function mergeSimPositions(positions) {
       acc.lots = totalLots;
       acc.marginLocked = (acc.marginLocked || 0) + (p.marginLocked || 0);
       acc.legs = acc.legs.concat(pLegs);
+      delete acc.peakRoiPct;
       if (!acc.symbol && p.symbol) acc.symbol = p.symbol;
     }
   });
@@ -2279,6 +2348,9 @@ function placeSimOrder(customStrike = null, customAction = null, customLots = nu
     existing.lots = totalLots;
     existing.marginLocked = (existing.marginLocked || 0) + (isBuyer ? 0 : (marginPerLot * lots));
     existing.time = nowTime;
+    const { pnlNtd: mergedPnl } = calcPosUnrealized(existing);
+    const mergedBaseCap = isBuyer ? Math.max(500, Math.round(existing.entryPrice * 50 * existing.lots)) : Math.max(35000, existing.marginLocked || 35000);
+    existing.peakRoiPct = Math.round(((mergedPnl / mergedBaseCap) * 100) * 10) / 10;
     if (!existing.symbol && symInfo.symbol) existing.symbol = symInfo.symbol;
     SIM_STATE.positions.splice(existingIdx, 1);
     SIM_STATE.positions.unshift(existing);
@@ -2746,82 +2818,6 @@ function drawSimPortfolioPayoff(minS, maxS) {
   ctx.fillText(String(minS), padL, H - 6);
   ctx.fillText(String(SIM_FORM.whatIfSettle), wx, H - 6);
   ctx.fillText(String(maxS), padL + plotW, H - 6);
-}
-
-// ============================================================================
-// Tab 4: 盤勢分析報告與策略中心 (參照 op-win.com/ctlist.jsp)
-// ============================================================================
-function renderAnalysisTab() {
-  const cfg = getSessionConfig();
-  const rep = cfg.analysisReport;
-  const chain = ACTIVE_CHAIN;
-  const container = document.getElementById("tab-analysis");
-
-  container.innerHTML = `
-    <div class="panel-card">
-      <div class="panel-header">
-        <div>
-          <h2 class="section-h2">台指盤勢與選擇權支撐壓力分析報告（量化模組解讀）</h2>
-          <div style="font-size:0.78rem;color:var(--muted);margin-top:3px">結合期交所即時量能、選擇權最大未平倉支撐壓力區與三大法人買賣方籌碼結構</div>
-        </div>
-        <select class="select-input" onchange="onSessionChange(this.value)">
-          <option value="LIVE_TAIFEX" ${CURRENT_SESSION_ID === 'LIVE_TAIFEX' ? 'selected' : ''}>🟢 期交所即時連線分析</option>
-          ${MARKET_SESSIONS.map(s => `<option value="${s.id}" ${s.id === CURRENT_SESSION_ID ? 'selected' : ''}>${escapeHtml(s.label)}</option>`).join("")}
-        </select>
-      </div>
-
-      <div style="background:rgba(37,99,235,0.14);border:1px solid rgba(37,99,235,0.4);border-radius:12px;padding:16px;margin-bottom:16px">
-        <div style="font-size:0.76rem;color:#38bdf8;font-weight:700">📌 最新分析報告摘要</div>
-        <div style="font-size:1.12rem;font-weight:800;color:#fff;margin-top:4px">${escapeHtml(rep.headline)}</div>
-      </div>
-
-      <h3 class="section-h2" style="margin-bottom:12px">盤面關鍵指標觀察</h3>
-      <div class="table-scroll" style="margin-bottom:18px">
-        <table class="t-table">
-          <thead>
-            <tr>
-              <th style="text-align:left;width:160px">觀察指標</th>
-              <th style="text-align:left;width:230px">當前態勢</th>
-              <th style="text-align:left">量化模組深度解讀</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr>
-              <td style="text-align:left;font-weight:700;color:#fff">成交量能與委買賣</td>
-              <td style="text-align:left;color:#38bdf8">即時量能與大單監控</td>
-              <td style="text-align:left;color:#cbd5e1">${escapeHtml(rep.volumeNote)}</td>
-            </tr>
-            <tr>
-              <td style="text-align:left;font-weight:700;color:#fff">期現貨價差</td>
-              <td style="text-align:left;color:#fde047">期貨 ${fmtNum(cfg.txfClose)} / 現貨 ${fmtNum(cfg.spotClose)}</td>
-              <td style="text-align:left;color:#cbd5e1">${escapeHtml(rep.spreadNote)}</td>
-            </tr>
-            <tr>
-              <td style="text-align:left;font-weight:700;color:#fff">大戶單筆口數比</td>
-              <td style="text-align:left;color:#4ade80">主力 vs 散戶委託結構</td>
-              <td style="text-align:left;color:#cbd5e1">${escapeHtml(rep.weightsNote)}</td>
-            </tr>
-            <tr>
-              <td style="text-align:left;font-weight:700;color:#fff">選擇權支撐壓力區</td>
-              <td style="text-align:left;color:#f87171">${fmtNum(chain.putWallStrike)} ~ ${fmtNum(chain.callWallStrike)}</td>
-              <td style="text-align:left;color:#cbd5e1">下檔 ${fmtNum(chain.putWallStrike)} Put 最大支撐地板；上檔 ${fmtNum(chain.callWallStrike)} Call 最大壓力天花板，最大痛點 ${fmtNum(chain.maxPainStrike)}。</td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-
-      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px;margin-bottom:18px">
-        <div style="background:#090e1a;border:1px solid var(--border);border-top:3px solid var(--royal);border-radius:10px;padding:15px">
-          <h4 style="margin:0 0 8px;color:#38bdf8">📈 技術面與多空成本解析</h4>
-          <p style="margin:0;font-size:0.88rem;color:#cbd5e1;line-height:1.65">${escapeHtml(rep.techView)}</p>
-        </div>
-        <div style="background:#090e1a;border:1px solid var(--border);border-top:3px solid #10b981;border-radius:10px;padding:15px">
-          <h4 style="margin:0 0 8px;color:#34d399">🎯 選擇權籌碼面深度解析</h4>
-          <p style="margin:0;font-size:0.88rem;color:#cbd5e1;line-height:1.65">${escapeHtml(rep.chipView)}</p>
-        </div>
-      </div>
-    </div>
-  `;
 }
 
 // ============================================================================

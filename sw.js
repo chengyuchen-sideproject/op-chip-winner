@@ -1,4 +1,4 @@
-const CACHE_NAME = 'op-chip-winner-v1';
+const CACHE_NAME = 'op-chip-winner-v2';
 const ASSETS = [
   './',
   './index.html',
@@ -24,6 +24,14 @@ self.addEventListener('activate', e => {
 self.addEventListener('fetch', e => {
   if (e.request.method !== 'GET') return;
   e.respondWith(
-    caches.match(e.request).then(cached => cached || fetch(e.request))
+    fetch(e.request)
+      .then(resp => {
+        if (resp && resp.ok && e.request.url.startsWith(self.location.origin)) {
+          const clone = resp.clone();
+          caches.open(CACHE_NAME).then(c => c.put(e.request, clone)).catch(() => {});
+        }
+        return resp;
+      })
+      .catch(() => caches.match(e.request))
   );
 });

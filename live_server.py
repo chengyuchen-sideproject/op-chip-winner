@@ -6,7 +6,7 @@ OP 籌碼贏家 Pro — 本地即時行情伺服器 (內建臺灣期貨交易所
 """
 import os
 import sys
-from http.server import HTTPServer, SimpleHTTPRequestHandler
+from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from urllib.request import Request, urlopen
 
 
@@ -47,4 +47,4 @@ if __name__ == "__main__":
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8088
     print("Serving OP Chip Winner Pro (with Live TAIFEX MIS Proxy) at http://127.0.0.1:{0}".format(port))
-    HTTPServer(("127.0.0.1", port), TaifexProxyHandler).serve_forever()
+    ThreadingHTTPServer(("127.0.0.1", port), TaifexProxyHandler).serve_forever()
