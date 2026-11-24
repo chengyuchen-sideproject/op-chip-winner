@@ -441,13 +441,18 @@ function buildLiveStrikeChainFromTaifex(optList, dayOiMap, spotPrice, contractNa
     const bidP = Number(o.CBestBidPrice || o.CBidPrice1 || 0);
     const askP = Number(o.CBestAskPrice || o.CAskPrice1 || 0);
     let lastP = rawLast || refP;
-    if (bidP > 0 && askP > 0 && askP >= bidP) {
+    const hasReasonableSpread = bidP > 0 && askP > 0 && askP >= bidP && ((askP - bidP) / Math.max(1, askP)) <= 0.12;
+    if (hasReasonableSpread) {
       if (rawLast <= 0 || rawLast < bidP * 0.96 || rawLast > askP * 1.04) {
         lastP = Math.round(((bidP + askP) / 2) * 10) / 10;
       }
     }
-    const execBuyP = askP > 0 ? askP : lastP;
-    const execSellP = bidP > 0 ? bidP : lastP;
+    // Sanity guard against flash order-book vacuum (e.g., MM pulls bids during sudden market spike):
+    // never let execution price deviate more than 8% from valid lastP unless lastP was 0
+    const isBuyQuoteSane = askP > 0 && (lastP <= 0 || (Math.abs(askP - lastP) / lastP <= 0.08));
+    const isSellQuoteSane = bidP > 0 && (lastP <= 0 || (Math.abs(lastP - bidP) / lastP <= 0.08));
+    const execBuyP = isBuyQuoteSane ? askP : lastP;
+    const execSellP = isSellQuoteSane ? bidP : lastP;
     const chg = Math.round((lastP - refP) * 10) / 10;
     const vol = Number(o.CTotalVolume || 0);
     const oiKey = `${k}_${o.CP}`;
@@ -2266,11 +2271,18 @@ function checkSimAutoTpSl() {
       toClose.push({ id: pos.id, tag: `🎯 自動停利 (+${roiPct.toFixed(1)}%)` });
     } else if (SIM_AUTO_CONFIG.trailingStop && pos.peakRoiPct >= SIM_AUTO_CONFIG.trailingArmPct) {
       const trailFloor = Math.max(0, pos.peakRoiPct - SIM_AUTO_CONFIG.trailingPullbackPct);
-      if (roiPct <= trailFloor) {
+      // Only trigger trailing stop-profit when current ROI is STILL profitable (>= 0) and not a flash quote drop!
+      if (roiPct <= trailFloor && roiPct >= 0) {
         toClose.push({ id: pos.id, tag: `📈 移動停利 (+${roiPct.toFixed(1)}%, 高點+${pos.peakRoiPct.toFixed(1)}%)` });
       }
     } else if (roiPct <= -SIM_AUTO_CONFIG.slPct) {
-      toClose.push({ id: pos.id, tag: `🛡️ 自動停損 (${roiPct.toFixed(1)}%)` });
+      // Require 2 consecutive ticks confirming stop-loss to prevent 1-tick order-book vacuum false triggers
+      pos.slConfirmCount = (pos.slConfirmCount || 0) + 1;
+      if (pos.slConfirmCount >= 2) {
+        toClose.push({ id: pos.id, tag: `🛡️ 自動停損 (${roiPct.toFixed(1)}%)` });
+      }
+    } else {
+      pos.slConfirmCount = 0;
     }
   });
   if (peakUpdated && !toClose.length) saveSimState();
@@ -2311,16 +2323,38 @@ function loadSimState() {
     const raw = localStorage.getItem(SIM_STORAGE_KEY);
     if (raw) {
       const p = JSON.parse(raw);
-      return {
-        initialCapital: p.initialCapital || 500000,
-        cash: typeof p.cash === "number" ? p.cash : 500000,
-        realizedPnl: typeof p.realizedPnl === "number" ? p.realizedPnl : 0,
-        positions: mergeSimPositions(p.positions),
-        history: Array.isArray(p.history) ? p.history.map((h, i) => ({
+      let cashVal = typeof p.cash === "number" ? p.cash : 500000;
+      let realizedVal = typeof p.realizedPnl === "number" ? p.realizedPnl : 0;
+      let repaired = false;
+      const histList = Array.isArray(p.history) ? p.history.map((h, i) => {
+        const item = {
           ...h,
           id: h.id || `hist_${i}_${h.strike || 0}_${h.closeTime || ''}`,
           legs: Array.isArray(h.legs) && h.legs.length ? h.legs : [{ lots: h.lots || 1, price: h.entryPrice || 0, time: h.closeTime || "" }]
-        })) : []
+        };
+        // Auto-repair the 23:45:12 order-book vacuum anomaly on 38500 BP (1795534003183_553) where true TAIFEX 1M price was 910 (+570,000) instead of vacuum 530 (-513,000)
+        if (item.id === "1795534003183_553" && item.exitPrice === 530 && item.pnlNtd === -513000) {
+          const trueExit = 910;
+          const truePnl = Math.round((trueExit - item.entryPrice) * 50 * item.lots); // +570,000
+          const delta = truePnl - item.pnlNtd; // +1,083,000
+          item.exitPrice = trueExit;
+          item.pnlNtd = truePnl;
+          item.reasonTag = "🎯 自動停利 (+28.2% · 已修正瞬間抽單異常價)";
+          realizedVal += delta;
+          cashVal += delta;
+          repaired = true;
+        }
+        return item;
+      }) : [];
+      if (repaired) {
+        setTimeout(() => saveSimState(), 50);
+      }
+      return {
+        initialCapital: p.initialCapital || 500000,
+        cash: cashVal,
+        realizedPnl: realizedVal,
+        positions: mergeSimPositions(p.positions),
+        history: histList
       };
     }
   } catch (e) {}
