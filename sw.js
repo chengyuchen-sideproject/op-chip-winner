@@ -1,4 +1,4 @@
-const CACHE_NAME = 'op-chip-winner-v2';
+const CACHE_NAME = 'op-chip-winner-v3';
 const ASSETS = [
   './',
   './index.html',

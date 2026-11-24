@@ -427,31 +427,41 @@ function buildLiveStrikeChainFromTaifex(optList, dayOiMap, spotPrice, contractNa
       strikeMap[k] = {
         strike: k,
         isAtm: k === atmStrike,
-        callSymbol: "", callPrice: 0, callRef: 0, callChg: 0, callVol: 0, callOi: 0, callOiDelta: 0, callBid: 0, callAsk: 0, callBidP: 0, callAskP: 0, callAction: "SC",
-        putSymbol: "",  putPrice: 0,  putRef: 0,  putChg: 0,  putVol: 0,  putOi: 0,  putOiDelta: 0,  putBid: 0,  putAsk: 0,  putBidP: 0,  putAskP: 0,  putAction: "SP",
+        callSymbol: "", callPrice: 0, callExecBuyP: 0, callExecSellP: 0, callRef: 0, callChg: 0, callVol: 0, callOi: 0, callOiDelta: 0, callBid: 0, callAsk: 0, callBidP: 0, callAskP: 0, callAction: "SC",
+        putSymbol: "",  putPrice: 0,  putExecBuyP: 0,  putExecSellP: 0,  putRef: 0,  putChg: 0,  putVol: 0,  putOi: 0,  putOiDelta: 0,  putBid: 0,  putAsk: 0,  putBidP: 0,  putAskP: 0,  putAction: "SP",
         intradayCurve: [],
         weeklyCurve: []
       };
     }
     const row = strikeMap[k];
-    const lastP = Number(o.CLastPrice || o.CRefPrice || 0);
-    const refP = Number(o.CRefPrice || lastP || 0);
-    const chg = Math.round((lastP - refP) * 10) / 10;
-    const vol = Number(o.CTotalVolume || 0);
-    const oiKey = `${k}_${o.CP}`;
-    const oi = Number(o.OpenInterest || dayOiMap[oiKey] || 0);
+    const rawLast = Number(o.CLastPrice || 0);
+    const refP = Number(o.CRefPrice || rawLast || 0);
     const bidSz = Number(o.CBestBidSize || o.CBidSize1 || 0);
     const askSz = Number(o.CBestAskSize || o.CAskSize1 || 0);
     const bidP = Number(o.CBestBidPrice || o.CBidPrice1 || 0);
     const askP = Number(o.CBestAskPrice || o.CAskPrice1 || 0);
+    let lastP = rawLast || refP;
+    if (bidP > 0 && askP > 0 && askP >= bidP) {
+      if (rawLast <= 0 || rawLast < bidP * 0.96 || rawLast > askP * 1.04) {
+        lastP = Math.round(((bidP + askP) / 2) * 10) / 10;
+      }
+    }
+    const execBuyP = askP > 0 ? askP : lastP;
+    const execSellP = bidP > 0 ? bidP : lastP;
+    const chg = Math.round((lastP - refP) * 10) / 10;
+    const vol = Number(o.CTotalVolume || 0);
+    const oiKey = `${k}_${o.CP}`;
+    const oi = Number(o.OpenInterest || dayOiMap[oiKey] || 0);
 
     if (contractName && lastP > 0) {
-      CONTRACT_PRICE_CACHE[contractName][`${k}_${o.CP}`] = { price: lastP, symbol: o.SymbolID || "", bidP, askP };
+      CONTRACT_PRICE_CACHE[contractName][`${k}_${o.CP}`] = { price: lastP, execBuyP, execSellP, symbol: o.SymbolID || "", bidP, askP };
     }
 
     if (o.CP === "C") {
       row.callSymbol = o.SymbolID || "";
       row.callPrice = lastP;
+      row.callExecBuyP = execBuyP;
+      row.callExecSellP = execSellP;
       row.callRef = refP;
       row.callChg = chg;
       row.callVol = vol;
@@ -466,6 +476,8 @@ function buildLiveStrikeChainFromTaifex(optList, dayOiMap, spotPrice, contractNa
     } else if (o.CP === "P") {
       row.putSymbol = o.SymbolID || "";
       row.putPrice = lastP;
+      row.putExecBuyP = execBuyP;
+      row.putExecSellP = execSellP;
       row.putRef = refP;
       row.putChg = chg;
       row.putVol = vol;
@@ -493,11 +505,11 @@ function buildLiveStrikeChainFromTaifex(optList, dayOiMap, spotPrice, contractNa
     const pWeight = s.putOi > 0 ? s.putOi : s.putVol;
     totalCallOi += cWeight;
     totalPutOi += pWeight;
-    // For Call/Put walls, prefer actionable strikes near ATM (+/- 2500) if available, else full contract
-    if (Math.abs(s.strike - atmStrike) <= 2500 || maxCallOi < 0) {
+    // For Call/Put walls, Call Wall is overhead resistance (>= atmStrike - 100 within +2500) and Put Wall is downside support (<= atmStrike + 100 within -2500)
+    if ((s.strike >= atmStrike - 100 && s.strike <= atmStrike + 2500) || maxCallOi < 0) {
       if (cWeight > maxCallOi) { maxCallOi = cWeight; callWallStrike = s.strike; }
     }
-    if (Math.abs(s.strike - atmStrike) <= 2500 || maxPutOi < 0) {
+    if ((s.strike <= atmStrike + 100 && s.strike >= atmStrike - 2500) || maxPutOi < 0) {
       if (pWeight > maxPutOi) { maxPutOi = pWeight; putWallStrike = s.strike; }
     }
 
@@ -1872,35 +1884,12 @@ let SIM_AUTO_CONFIG = {
   trailingArmPct: 15,
   trailingPullbackPct: 8,
   allocBudgetPct: 30,
-  recWeights: [50, 30, 20]
+  minConfidencePct: 80
 };
 
-function getNormalizedRecWeights(count) {
-  if (count <= 0) return [];
-  if (count === 1) return [100];
-  const raw = (SIM_AUTO_CONFIG.recWeights || [50, 30, 20]).slice(0, count).map(w => Math.max(0, Number(w) || 0));
-  const total = raw.reduce((a, b) => a + b, 0);
-  if (total <= 0) {
-    const eq = Math.floor(100 / count);
-    const res = new Array(count).fill(eq);
-    res[0] += 100 - eq * count;
-    return res;
-  }
-  const norm = raw.map(w => Math.round((w / total) * 100));
-  const diff = 100 - norm.reduce((a, b) => a + b, 0);
-  norm[0] += diff;
-  return norm;
-}
-
-function setRecWeightAt(idx, val) {
-  if (!Array.isArray(SIM_AUTO_CONFIG.recWeights)) SIM_AUTO_CONFIG.recWeights = [50, 30, 20];
-  const n = Math.max(0, Math.min(100, Math.round(Number(val) || 0)));
-  SIM_AUTO_CONFIG.recWeights[idx] = n;
-  renderSimTab();
-}
-
-function applyRecWeightPreset(w0, w1, w2) {
-  SIM_AUTO_CONFIG.recWeights = [w0, w1, w2];
+function setMinConfidencePct(val) {
+  const n = Math.max(50, Math.min(99, Math.round(Number(val) || 80)));
+  SIM_AUTO_CONFIG.minConfidencePct = n;
   renderSimTab();
 }
 let SIM_LAST_AUTO_MSG = "";
@@ -2041,32 +2030,34 @@ function buildWeeklyAllocationRecommendations() {
 
   chain.strikes.forEach(s => {
     const dist = s.strike - atm;
+    const pEntry = s.putExecBuyP || s.putPrice;
+    const cEntry = s.callExecBuyP || s.callPrice;
     if (mainAct === "BP") {
       // Core BP: ATM to -300 OTM (High Delta)
-      if (s.putPrice >= 30 && s.putPrice <= 2200 && dist <= 100 && dist >= -300 && (s.putVol > 0 || s.putOi > 0)) {
-        const sc = scoreCandidate(48, 50, 30, s.putVol, s.putBid, s.putAsk, s.putBidP, s.putAskP, s.putPrice, s.strike, "BP", false);
+      if (pEntry >= 30 && pEntry <= 2200 && dist <= 100 && dist >= -300 && (s.putVol > 0 || s.putOi > 0)) {
+        const sc = scoreCandidate(48, 50, 30, s.putVol, s.putBid, s.putAsk, s.putBidP, s.putAskP, pEntry, s.strike, "BP", false);
         coreCandidates.push({
-          strike: s.strike, cp: "P", action: "BP", price: s.putPrice, vol: s.putVol, oi: s.putOi,
+          strike: s.strike, cp: "P", action: "BP", price: pEntry, vol: s.putVol, oi: s.putOi,
           winScore: sc.score,
           role: "🔥 1. 核心順勢買方 (近價平)",
           reason: `空方主導 (${dist}點)，${sc.metaTag}，成交量 ${fmtNum(s.putVol)} 口`
         });
       }
       // Leverage BP: -400 to -1000 OTM (Lower premium, high Gamma leverage)
-      if (s.putPrice >= 15 && s.putPrice <= 1200 && dist <= -400 && dist >= -1000 && (s.putVol > 0 || s.putOi > 0)) {
-        const sc = scoreCandidate(45, 40, 28, s.putVol, s.putBid, s.putAsk, s.putBidP, s.putAskP, s.putPrice, s.strike, "BP", false);
+      if (pEntry >= 15 && pEntry <= 1200 && dist <= -400 && dist >= -1000 && (s.putVol > 0 || s.putOi > 0)) {
+        const sc = scoreCandidate(45, 40, 28, s.putVol, s.putBid, s.putAsk, s.putBidP, s.putAskP, pEntry, s.strike, "BP", false);
         leverageCandidates.push({
-          strike: s.strike, cp: "P", action: "BP", price: s.putPrice, vol: s.putVol, oi: s.putOi,
+          strike: s.strike, cp: "P", action: "BP", price: pEntry, vol: s.putVol, oi: s.putOi,
           winScore: sc.score,
           role: "⚡ 2. 高槓桿波段買方 (價外)",
           reason: `權利金成本較低 (${dist}點)，${sc.metaTag}，急殺放大快`
         });
       }
       // Hedge BC: +200 to +800 OTM (Cheap reversal protection)
-      if (s.callPrice >= 15 && s.callPrice <= 900 && dist >= 200 && dist <= 800 && (s.callVol > 0 || s.callOi > 0)) {
-        const sc = scoreCandidate(43, 40, 25, s.callVol, s.callBid, s.callAsk, s.callBidP, s.callAskP, s.callPrice, s.strike, "BC", true);
+      if (cEntry >= 15 && cEntry <= 900 && dist >= 200 && dist <= 800 && (s.callVol > 0 || s.callOi > 0)) {
+        const sc = scoreCandidate(43, 40, 25, s.callVol, s.callBid, s.callAsk, s.callBidP, s.callAskP, cEntry, s.strike, "BC", true);
         hedgeCandidates.push({
-          strike: s.strike, cp: "C", action: "BC", price: s.callPrice, vol: s.callVol, oi: s.callOi,
+          strike: s.strike, cp: "C", action: "BC", price: cEntry, vol: s.callVol, oi: s.callOi,
           winScore: sc.score,
           role: "🛡️ 3. 買方反轉保護單 (BC避險)",
           reason: `防軋空反轉 (+${dist}點)，${sc.metaTag}，買方勒式保護`
@@ -2074,30 +2065,30 @@ function buildWeeklyAllocationRecommendations() {
       }
     } else {
       // Core BC: ATM to +300 OTM
-      if (s.callPrice >= 30 && s.callPrice <= 2200 && dist >= -100 && dist <= 300 && (s.callVol > 0 || s.callOi > 0)) {
-        const sc = scoreCandidate(48, 50, 30, s.callVol, s.callBid, s.callAsk, s.callBidP, s.callAskP, s.callPrice, s.strike, "BC", false);
+      if (cEntry >= 30 && cEntry <= 2200 && dist >= -100 && dist <= 300 && (s.callVol > 0 || s.callOi > 0)) {
+        const sc = scoreCandidate(48, 50, 30, s.callVol, s.callBid, s.callAsk, s.callBidP, s.callAskP, cEntry, s.strike, "BC", false);
         coreCandidates.push({
-          strike: s.strike, cp: "C", action: "BC", price: s.callPrice, vol: s.callVol, oi: s.callOi,
+          strike: s.strike, cp: "C", action: "BC", price: cEntry, vol: s.callVol, oi: s.callOi,
           winScore: sc.score,
           role: "🔥 1. 核心順勢買方 (近價平)",
           reason: `多方主導 (+${dist}點)，${sc.metaTag}，成交量 ${fmtNum(s.callVol)} 口`
         });
       }
       // Leverage BC: +400 to +1000 OTM
-      if (s.callPrice >= 15 && s.callPrice <= 1200 && dist >= 400 && dist <= 1000 && (s.callVol > 0 || s.callOi > 0)) {
-        const sc = scoreCandidate(45, 40, 28, s.callVol, s.callBid, s.callAsk, s.callBidP, s.callAskP, s.callPrice, s.strike, "BC", false);
+      if (cEntry >= 15 && cEntry <= 1200 && dist >= 400 && dist <= 1000 && (s.callVol > 0 || s.callOi > 0)) {
+        const sc = scoreCandidate(45, 40, 28, s.callVol, s.callBid, s.callAsk, s.callBidP, s.callAskP, cEntry, s.strike, "BC", false);
         leverageCandidates.push({
-          strike: s.strike, cp: "C", action: "BC", price: s.callPrice, vol: s.callVol, oi: s.callOi,
+          strike: s.strike, cp: "C", action: "BC", price: cEntry, vol: s.callVol, oi: s.callOi,
           winScore: sc.score,
           role: "⚡ 2. 高槓桿波段買方 (價外)",
           reason: `權利金成本較低 (+${dist}點)，${sc.metaTag}，突破放大快`
         });
       }
       // Hedge BP: -200 to -800 OTM
-      if (s.putPrice >= 15 && s.putPrice <= 900 && dist <= -200 && dist >= -800 && (s.putVol > 0 || s.putOi > 0)) {
-        const sc = scoreCandidate(43, 40, 25, s.putVol, s.putBid, s.putAsk, s.putBidP, s.putAskP, s.putPrice, s.strike, "BP", true);
+      if (pEntry >= 15 && pEntry <= 900 && dist <= -200 && dist >= -800 && (s.putVol > 0 || s.putOi > 0)) {
+        const sc = scoreCandidate(43, 40, 25, s.putVol, s.putBid, s.putAsk, s.putBidP, s.putAskP, pEntry, s.strike, "BP", true);
         hedgeCandidates.push({
-          strike: s.strike, cp: "P", action: "BP", price: s.putPrice, vol: s.putVol, oi: s.putOi,
+          strike: s.strike, cp: "P", action: "BP", price: pEntry, vol: s.putVol, oi: s.putOi,
           winScore: sc.score,
           role: "🛡️ 3. 買方反轉保護單 (BP避險)",
           reason: `防急殺回測 (${dist}點)，${sc.metaTag}，買方勒式保護`
@@ -2110,7 +2101,7 @@ function buildWeeklyAllocationRecommendations() {
   leverageCandidates.sort((a, b) => b.winScore - a.winScore);
   hedgeCandidates.sort((a, b) => b.winScore - a.winScore);
 
-  const MIN_CONFIDENCE = 80;
+  const MIN_CONFIDENCE = Math.max(50, Math.min(99, Number(SIM_AUTO_CONFIG.minConfidencePct) || 80));
   const picked = [];
   const usedKeys = new Set();
   const pushUnique = (item) => {
@@ -2126,7 +2117,7 @@ function buildWeeklyAllocationRecommendations() {
   pushUnique(leverageCandidates.find(x => x.winScore >= MIN_CONFIDENCE));
   pushUnique(hedgeCandidates.find(x => x.winScore >= MIN_CONFIDENCE));
 
-  // If fewer than 3 picks reached 80% across categories, fill remaining slots from other >=80% candidates
+  // If fewer than 3 picks reached threshold across categories, fill remaining slots from other >=MIN_CONFIDENCE candidates
   if (picked.length < 3) {
     const allHighConf = [...coreCandidates, ...leverageCandidates, ...hedgeCandidates]
       .filter(x => x.winScore >= MIN_CONFIDENCE)
@@ -2138,8 +2129,8 @@ function buildWeeklyAllocationRecommendations() {
 
   if (!picked.length) return [];
 
-  // Assign adjustable percentage weights normalized to 100%
-  const weightProfiles = getNormalizedRecWeights(picked.length);
+  // Assign percentage weights summing to 100% (previous version setting)
+  const weightProfiles = picked.length === 3 ? [50, 30, 20] : (picked.length === 2 ? [60, 40] : [100]);
   const deployBudget = Math.max(20000, Math.round(SIM_STATE.cash * (SIM_AUTO_CONFIG.allocBudgetPct / 100)));
   const tpPct = SIM_AUTO_CONFIG.tpPct;
   const slPct = SIM_AUTO_CONFIG.slPct;
@@ -2173,11 +2164,18 @@ function buildWeeklyAllocationRecommendations() {
 function executeAutoRecommendedPortfolio() {
   const recs = buildWeeklyAllocationRecommendations();
   if (!recs.length) {
-    alert("目前尚無信心度 80% 以上的週選推薦標的！");
+    alert(`目前尚無信心度 ${SIM_AUTO_CONFIG.minConfidencePct}% 以上的週選推薦標的！`);
     return;
   }
+  const activeContract = (ACTIVE_CHAIN && ACTIVE_CHAIN.contract) || TAIFEX_EXPIRE_MONTH || getSessionConfig().contract || "202611W4";
   let placed = 0;
+  let skippedDup = 0;
   recs.forEach(r => {
+    const alreadyHeld = SIM_STATE.positions.some(p => p.contract === activeContract && p.strike === r.strike && p.action === r.action);
+    if (alreadyHeld) {
+      skippedDup++;
+      return;
+    }
     const isBuy = r.action === "BC" || r.action === "BP";
     const reqCash = isBuy ? Math.round(r.price * 50 * r.suggestedLots) : (35000 * r.suggestedLots);
     if (SIM_STATE.cash >= reqCash) {
@@ -2185,7 +2183,11 @@ function executeAutoRecommendedPortfolio() {
       placed++;
     }
   });
-  SIM_LAST_AUTO_MSG = `🤖 已自動依百分比配置建倉 ${placed} 檔週選部位（合約：${TAIFEX_EXPIRE_MONTH || '近週選'}）！`;
+  if (placed === 0 && skippedDup > 0) {
+    SIM_LAST_AUTO_MSG = `ℹ️ 推薦標的已於持倉中（避免重複疊加歐印），如需加碼請使用下方單筆下單。`;
+  } else {
+    SIM_LAST_AUTO_MSG = `🤖 已自動依百分比配置建倉 ${placed} 檔週選部位（合約：${TAIFEX_EXPIRE_MONTH || '近週選'}${skippedDup ? `，略過 ${skippedDup} 檔已持倉標的` : ''}）！`;
+  }
   renderSimTab();
 }
 
@@ -2194,7 +2196,8 @@ function checkSimAutoTpSl() {
   const toClose = [];
   let peakUpdated = false;
   SIM_STATE.positions.forEach(pos => {
-    const { pnlNtd } = calcPosUnrealized(pos);
+    const { pnlNtd, hasLiveQuote } = calcPosUnrealized(pos);
+    if (!hasLiveQuote) return;
     const isBuyer = pos.action === "BC" || pos.action === "BP";
     const baseCapital = isBuyer ? Math.max(500, Math.round(pos.entryPrice * 50 * pos.lots)) : Math.max(35000, pos.marginLocked || 35000);
     const roiPct = (pnlNtd / baseCapital) * 100;
@@ -2279,9 +2282,12 @@ function resetSimAccount() {
   renderSimTab();
 }
 
-function getLiveOptionPrice(strike, cp, contractName = "") {
+function getLiveOptionPrice(strike, cp, contractName = "", side = "mid") {
   if (contractName && CONTRACT_PRICE_CACHE[contractName] && CONTRACT_PRICE_CACHE[contractName][`${strike}_${cp}`]) {
-    return CONTRACT_PRICE_CACHE[contractName][`${strike}_${cp}`].price;
+    const item = CONTRACT_PRICE_CACHE[contractName][`${strike}_${cp}`];
+    if (side === "buy" && item.execBuyP > 0) return item.execBuyP;
+    if (side === "sell" && item.execSellP > 0) return item.execSellP;
+    return item.price;
   }
   if (!ACTIVE_CHAIN || !ACTIVE_CHAIN.strikes) return 0;
   if (contractName && ACTIVE_CHAIN.contract && ACTIVE_CHAIN.contract !== contractName) {
@@ -2289,15 +2295,26 @@ function getLiveOptionPrice(strike, cp, contractName = "") {
   }
   const row = ACTIVE_CHAIN.strikes.find(x => x.strike === strike);
   if (!row) return 0;
-  return cp === "C" ? row.callPrice : row.putPrice;
+  if (cp === "C") {
+    if (side === "buy" && row.callExecBuyP > 0) return row.callExecBuyP;
+    if (side === "sell" && row.callExecSellP > 0) return row.callExecSellP;
+    return row.callPrice;
+  } else {
+    if (side === "buy" && row.putExecBuyP > 0) return row.putExecBuyP;
+    if (side === "sell" && row.putExecSellP > 0) return row.putExecSellP;
+    return row.putPrice;
+  }
 }
 
 function calcPosUnrealized(pos) {
-  const curP = getLiveOptionPrice(pos.strike, pos.cp, pos.contract) || pos.entryPrice;
   const isBuyer = pos.action === "BC" || pos.action === "BP";
+  const exitSide = isBuyer ? "sell" : "buy";
+  const liveP = getLiveOptionPrice(pos.strike, pos.cp, pos.contract, exitSide);
+  const curP = liveP > 0 ? liveP : pos.entryPrice;
   const diffPts = isBuyer ? (curP - pos.entryPrice) : (pos.entryPrice - curP);
   return {
     curPrice: curP,
+    hasLiveQuote: liveP > 0,
     pnlNtd: Math.round(diffPts * 50 * pos.lots)
   };
 }
@@ -2308,13 +2325,14 @@ function placeSimOrder(customStrike = null, customAction = null, customLots = nu
   const lots = Math.max(1, Number(customLots || SIM_FORM.lots || 1));
   const cp = (action === "BC" || action === "SC") ? "C" : "P";
   const activeContract = (ACTIVE_CHAIN && ACTIVE_CHAIN.contract) || TAIFEX_EXPIRE_MONTH || getSessionConfig().contract || "202611W4";
-  const price = getLiveOptionPrice(strike, cp, activeContract);
+  const isBuyer = action === "BC" || action === "BP";
+  const entrySide = isBuyer ? "buy" : "sell";
+  const price = getLiveOptionPrice(strike, cp, activeContract, entrySide);
   if (!price || price <= 0) {
     if (!silent) alert("此履約價目前尚無有效報價，請選擇其他活躍履約價！");
     return;
   }
 
-  const isBuyer = action === "BC" || action === "BP";
   const premiumNtd = Math.round(price * 50 * lots);
   const marginPerLot = 35000;
   const requiredCash = isBuyer ? premiumNtd : (marginPerLot * lots);
@@ -2447,8 +2465,10 @@ function renderSimTab() {
     SIM_FORM.action = SIM_FORM.action === "SP" ? "BP" : "BC";
   }
   const selCp = SIM_FORM.action === "BC" ? "C" : "P";
-  const selPrice = selCp === "C" ? selRow.callPrice : selRow.putPrice;
   const isBuyer = SIM_FORM.action === "BC" || SIM_FORM.action === "BP";
+  const selPrice = selCp === "C"
+    ? (isBuyer ? (selRow.callExecBuyP || selRow.callPrice) : (selRow.callExecSellP || selRow.callPrice))
+    : (isBuyer ? (selRow.putExecBuyP || selRow.putPrice) : (selRow.putExecSellP || selRow.putPrice));
   const estPrem = Math.round(selPrice * 50 * SIM_FORM.lots);
   const estMargin = isBuyer ? estPrem : (35000 * SIM_FORM.lots);
 
@@ -2502,7 +2522,7 @@ function renderSimTab() {
       <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">
         <div>
           <div style="font-size:1rem;font-weight:800;color:#fff">🤖 週選百分比購買推薦 & 自動化模擬操盤（目標合約：${escapeHtml(TAIFEX_EXPIRE_MONTH || '近週選')}）</div>
-          <div style="font-size:0.76rem;color:#cbd5e1;margin-top:2px">依即時 CP 差額、VWAP 成本與 OI 壓力支撐牆，僅挑選<strong>信心度 ≥ 80%</strong> 標的並標示建議停損/停利價格</div>
+          <div style="font-size:0.76rem;color:#cbd5e1;margin-top:2px">依即時 CP 差額、VWAP 成本與 OI 壓力支撐牆，僅挑選<strong>信心度 ≥ ${SIM_AUTO_CONFIG.minConfidencePct}%</strong> 標的並標示建議停損/停利價格</div>
         </div>
         <div class="btn-group">
           <button class="btn ${SIM_AUTO_CONFIG.enabled ? 'btn-teal' : ''}" onclick="SIM_AUTO_CONFIG.enabled=!SIM_AUTO_CONFIG.enabled;renderSimTab()">
@@ -2540,20 +2560,18 @@ function renderSimTab() {
           </div>
         </div>
         <div style="display:flex;flex-direction:column;gap:6px">
-          <span style="font-weight:700;color:#e2e8f0">推薦清單配置比例 (%)：</span>
+          <span style="font-weight:700;color:#e2e8f0">最低顯示信心度門檻 (%)：</span>
           <div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center">
-            ${[0, 1, 2].map(i => `
-              <label style="display:inline-flex;align-items:center;gap:3px;font-size:0.72rem;color:#cbd5e1">
-                <span>第${i + 1}檔</span>
-                <input type="number" min="0" max="100" step="5"
-                  value="${(SIM_AUTO_CONFIG.recWeights || [50, 30, 20])[i] ?? 0}"
-                  onchange="setRecWeightAt(${i}, this.value)"
-                  style="width:48px;padding:3px 5px;border-radius:6px;border:1px solid var(--border);background:#0f172a;color:#38bdf8;font-weight:700;text-align:center;font-size:0.74rem" />%
-              </label>
+            ${[70, 75, 80, 85, 90].map(c => `
+              <button class="btn ${SIM_AUTO_CONFIG.minConfidencePct === c ? 'active' : ''}" style="padding:4px 9px;font-size:0.73rem" onclick="setMinConfidencePct(${c})">≥${c}%</button>
             `).join("")}
-            <button class="btn" style="padding:3px 7px;font-size:0.7rem" onclick="applyRecWeightPreset(50,30,20)">50/30/20</button>
-            <button class="btn" style="padding:3px 7px;font-size:0.7rem" onclick="applyRecWeightPreset(70,20,10)">70/20/10</button>
-            <button class="btn" style="padding:3px 7px;font-size:0.7rem" onclick="applyRecWeightPreset(34,33,33)">均分</button>
+            <label style="display:inline-flex;align-items:center;gap:3px;font-size:0.72rem;color:#cbd5e1">
+              <span>自訂</span>
+              <input type="number" min="50" max="99" step="1"
+                value="${SIM_AUTO_CONFIG.minConfidencePct}"
+                onchange="setMinConfidencePct(this.value)"
+                style="width:52px;padding:3px 5px;border-radius:6px;border:1px solid var(--border);background:#0f172a;color:#34d399;font-weight:700;text-align:center;font-size:0.74rem" />%
+            </label>
           </div>
         </div>
       </div>
@@ -2586,7 +2604,7 @@ function renderSimTab() {
           </div>
         `).join("") : `
           <div style="grid-column:1/-1;padding:16px;text-align:center;color:var(--muted);font-size:0.84rem;background:rgba(15,23,42,0.5);border:1px dashed var(--border);border-radius:10px">
-            ⏳ 目前尚無信心度達 <strong>80% 以上</strong> 的週選推薦標的（建議觀望或等待盤中量能放大）。
+            ⏳ 目前尚無信心度達 <strong>${SIM_AUTO_CONFIG.minConfidencePct}% 以上</strong> 的週選推薦標的（可調降信心度門檻或等待盤中量能放大）。
           </div>
         `}
       </div>
