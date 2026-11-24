@@ -1947,18 +1947,24 @@ function buildWeeklyAllocationRecommendations() {
   const pVal = lastBar.putVal;
   // Detect Seller Range-Pin Regime (SC + SP: both Call and Put below zero axis)
   const isDoubleSellRange = cVal < 0 && pVal < 0;
-  const isBull = lastBar.cpDiffVal >= 0 && cVal >= 0;
+  // Determine dominant bull/bear direction directly from Green Line (CP Diff = CallVal - PutVal)
+  const isBull = lastBar.cpDiffVal >= 0;
   const mainAct = isBull ? "BC" : "BP";
+  const singleWingAttack = isBull ? (cVal >= 0 && pVal <= 0) : (pVal >= 0 && cVal <= 0);
+  const cpStrengthBonus = Math.min(4, Math.floor(Math.abs(lastBar.cpDiffVal) / 15000)) + (singleWingAttack ? 2 : 0);
 
-  // Multi-factor chip consensus: CP diff + Major chip + VWAP mid cost
+  // Multi-factor chip consensus: CP diff + Major chip + VWAP mid cost + Red/Blue cost breakout
   const majorAligned = isBull ? (lastBar.majorVal >= 0) : (lastBar.majorVal <= 0);
   const vwapAligned = isBull ? (lastBar.close >= lastBar.greenMidCost) : (lastBar.close <= lastBar.greenMidCost);
+  const costBandBreakout = isBull ? (lastBar.close >= lastBar.redBullCost) : (lastBar.close <= lastBar.blueBearCost);
   const alignCount = (majorAligned ? 1 : 0) + (vwapAligned ? 1 : 0);
 
-  // Short-term momentum slope check (last 3 bars + real live snapshot delta if available)
+  // Short-term momentum slope check (last 3 bars + real live snapshot delta + price slope)
   const prevBar = ACTIVE_BARS[Math.max(0, ACTIVE_BARS.length - 4)] || lastBar;
   const barCpSlope = lastBar.cpDiffVal - prevBar.cpDiffVal;
+  const barPriceSlope = lastBar.close - prevBar.close;
   let momentumAligned = isBull ? (barCpSlope >= 0) : (barCpSlope <= 0);
+  const priceSlopeAligned = isBull ? (barPriceSlope >= 0) : (barPriceSlope <= 0);
   if (CURRENT_SESSION_ID === "LIVE_TAIFEX" && LIVE_CHIP_SNAPSHOTS.length >= 2) {
     const firstSnap = LIVE_CHIP_SNAPSHOTS[Math.max(0, LIVE_CHIP_SNAPSHOTS.length - 4)];
     const lastSnap = LIVE_CHIP_SNAPSHOTS[LIVE_CHIP_SNAPSHOTS.length - 1];
@@ -1967,42 +1973,76 @@ function buildWeeklyAllocationRecommendations() {
       momentumAligned = isBull ? (snapDelta > 0) : (snapDelta < 0);
     }
   }
-  const momentumBonus = isDoubleSellRange ? -8 : (momentumAligned ? 3 : -5);
-  const trendBonus = (alignCount === 2 ? 8 : (alignCount === 1 ? 3 : -6)) + momentumBonus;
+  const momentumBonus = isDoubleSellRange
+    ? -8
+    : ((momentumAligned ? 3 : -4) + (priceSlopeAligned ? 2 : -4) + (costBandBreakout ? 2 : 0));
+  const trendBonus = (alignCount === 2 ? 7 : (alignCount === 1 ? 2 : -6)) + cpStrengthBonus + momentumBonus;
   const alignLabel = isDoubleSellRange
     ? "雙賣盤整慎追"
-    : `${alignCount === 2 ? "三線共振" : (alignCount === 1 ? "雙指標共振" : "籌碼分歧")}(${momentumAligned ? "動能加速" : "動能轉弱"})`;
+    : `${alignCount === 2 ? "三線共振" : (alignCount === 1 ? "雙指標共振" : "籌碼分歧")}(${momentumAligned && priceSlopeAligned ? "價量同向加速" : (priceSlopeAligned ? "價格順勢" : "短線逆勢反彈")})`;
 
   const now = new Date();
   const isWedSettleDay = now.getDay() === 3 && now.getHours() >= 8 && now.getHours() < 14;
   const isWedAfternoon = isWedSettleDay && now.getHours() >= 11;
 
-  const scoreCandidate = (baseScore, volDiv, volCap, vol, bidSz, askSz, bidP, askP, price, strike, act, isHedge) => {
+  // Compute percentile volume reference across near-ATM strikes so score adapts smoothly to early/mid/late session
+  const activeVols = chain.strikes
+    .map(s => Math.max(s.callVol || 0, s.putVol || 0))
+    .filter(v => v >= 10)
+    .sort((a, b) => b - a);
+  const refHighVol = Math.max(250, activeVols[Math.min(2, Math.max(0, activeVols.length - 1))] || 1200);
+
+  const scoreCandidate = (baseScore, volCap, vol, oi, chg, bidSz, askSz, bidP, askP, price, strike, act, isHedge) => {
     if (vol < 10) {
       return { score: 0, metaTag: "成交量不足" };
     }
-    const volScore = Math.min(volCap, Math.round(vol / volDiv));
-    const bidAskBonus = bidSz >= askSz ? 8 : 4;
+    // 1. Liquidity Score (Log-relative to session top volume + OI thickness, 0 ~ volCap pts)
+    const relVolRatio = Math.min(1, Math.log10(vol + 1) / Math.log10(refHighVol + 10));
+    const oiBonus = Math.min(3, Math.round(Math.log10((oi || 0) + 1)));
+    const volScore = Math.min(volCap, Math.round(relVolRatio * (volCap - 3)) + oiBonus);
+
+    // 2. Order Book & Premium Momentum (0 ~ 8 pts)
+    const imbRatio = (bidSz - askSz) / Math.max(1, bidSz + askSz);
+    const imbScore = Math.round((imbRatio + 1) * 2.5); // 0 ~ 5 pts
+    const chgScore = chg > 0 ? 3 : (chg === 0 ? 1 : -2);
+    const bidAskBonus = imbScore + chgScore;
+
+    // 3. Continuous Bid-Ask Spread Cost Score (-12 ~ +6 pts)
     let spreadBonus = 0;
     let spreadTag = "";
     if (bidP > 0 && askP > 0 && price > 0) {
       const spreadPct = ((askP - bidP) / price) * 100;
-      if (spreadPct <= 3) {
+      if (spreadPct <= 1.5) {
+        spreadBonus = 6;
+        spreadTag = `極低滑價 ${spreadPct.toFixed(1)}%`;
+      } else if (spreadPct <= 3.0) {
         spreadBonus = 4;
         spreadTag = `滑價低 ${spreadPct.toFixed(1)}%`;
-      } else if (spreadPct > 8) {
+      } else if (spreadPct <= 5.0) {
+        spreadBonus = 1;
+        spreadTag = `價差 ${spreadPct.toFixed(1)}%`;
+      } else if (spreadPct <= 8.0) {
+        spreadBonus = -5;
+        spreadTag = `價差偏寬 ${spreadPct.toFixed(1)}%`;
+      } else {
         spreadBonus = -12;
         spreadTag = `滑價偏高 ${spreadPct.toFixed(1)}%`;
-      } else {
-        spreadTag = `價差 ${spreadPct.toFixed(1)}%`;
       }
     }
+
+    // 4. OI Wall Support/Resistance Room & Time-Value Cost Efficiency (-7 ~ +5 pts)
     let wallBonus = 0;
     if (act === "BC" && chain.callWallStrike) {
-      wallBonus = strike <= chain.callWallStrike ? 3 : -6;
+      wallBonus = strike < chain.callWallStrike ? 3 : (strike === chain.callWallStrike ? 1 : -6);
     } else if (act === "BP" && chain.putWallStrike) {
-      wallBonus = strike >= chain.putWallStrike ? 3 : -6;
+      wallBonus = strike > chain.putWallStrike ? 3 : (strike === chain.putWallStrike ? 1 : -6);
     }
+    const intrinsic = act === "BC" ? Math.max(0, lastBar.close - strike) : Math.max(0, strike - lastBar.close);
+    const timeValue = Math.max(0, price - intrinsic);
+    const tvRatio = timeValue / Math.max(1, price);
+    const valueEfficiencyBonus = (!isHedge && tvRatio <= 0.65) ? 2 : (tvRatio >= 0.95 && price > 500 ? -2 : 0);
+
+    // 5. Settlement Day Theta / Gamma Adjustment (-10 ~ +4 pts)
     let thetaBonus = 0;
     let thetaTag = "";
     const absDist = Math.abs(strike - atm);
@@ -2015,10 +2055,21 @@ function buildWeeklyAllocationRecommendations() {
         thetaTag = "結算Gamma爆發";
       }
     }
-    const dirBonus = isHedge ? (alignCount === 0 && !isDoubleSellRange ? 6 : -4) : trendBonus;
-    const rawScore = baseScore + volScore + bidAskBonus + spreadBonus + wallBonus + thetaBonus + dirBonus;
+
+    // 6. Directional Consensus vs Reversal Hedge Need
+    let dirBonus = trendBonus;
+    if (isHedge) {
+      // Hedge leg is most valuable when main trend is overextended or showing short-term counter-bounce
+      dirBonus = (!priceSlopeAligned || alignCount <= 1) ? 7 : 3;
+      if (isDoubleSellRange) dirBonus = -4;
+    }
+
+    const rawScore = baseScore + volScore + bidAskBonus + spreadBonus + wallBonus + valueEfficiencyBonus + thetaBonus + dirBonus;
+    const finalScore = Math.max(0, Math.min(96, Math.round(rawScore)));
+    const breakdown = `基準${baseScore} + 量能${volScore} + 掛單動能${bidAskBonus} + 價差${spreadBonus >= 0 ? '+' + spreadBonus : spreadBonus} + 結構${wallBonus + valueEfficiencyBonus + thetaBonus >= 0 ? '+' + (wallBonus + valueEfficiencyBonus + thetaBonus) : (wallBonus + valueEfficiencyBonus + thetaBonus)} + 趨勢${dirBonus >= 0 ? '+' + dirBonus : dirBonus} = ${finalScore}%`;
     return {
-      score: Math.max(0, Math.min(96, Math.round(rawScore))),
+      score: finalScore,
+      breakdown,
       metaTag: [alignLabel, spreadTag, thetaTag].filter(Boolean).join("・")
     };
   };
@@ -2035,30 +2086,33 @@ function buildWeeklyAllocationRecommendations() {
     if (mainAct === "BP") {
       // Core BP: ATM to -300 OTM (High Delta)
       if (pEntry >= 30 && pEntry <= 2200 && dist <= 100 && dist >= -300 && (s.putVol > 0 || s.putOi > 0)) {
-        const sc = scoreCandidate(48, 50, 30, s.putVol, s.putBid, s.putAsk, s.putBidP, s.putAskP, pEntry, s.strike, "BP", false);
+        const sc = scoreCandidate(48, 22, s.putVol, s.putOi, s.putChg, s.putBid, s.putAsk, s.putBidP, s.putAskP, pEntry, s.strike, "BP", false);
         coreCandidates.push({
           strike: s.strike, cp: "P", action: "BP", price: pEntry, vol: s.putVol, oi: s.putOi,
           winScore: sc.score,
+          breakdown: sc.breakdown,
           role: "🔥 1. 核心順勢買方 (近價平)",
           reason: `空方主導 (${dist}點)，${sc.metaTag}，成交量 ${fmtNum(s.putVol)} 口`
         });
       }
       // Leverage BP: -400 to -1000 OTM (Lower premium, high Gamma leverage)
       if (pEntry >= 15 && pEntry <= 1200 && dist <= -400 && dist >= -1000 && (s.putVol > 0 || s.putOi > 0)) {
-        const sc = scoreCandidate(45, 40, 28, s.putVol, s.putBid, s.putAsk, s.putBidP, s.putAskP, pEntry, s.strike, "BP", false);
+        const sc = scoreCandidate(45, 20, s.putVol, s.putOi, s.putChg, s.putBid, s.putAsk, s.putBidP, s.putAskP, pEntry, s.strike, "BP", false);
         leverageCandidates.push({
           strike: s.strike, cp: "P", action: "BP", price: pEntry, vol: s.putVol, oi: s.putOi,
           winScore: sc.score,
+          breakdown: sc.breakdown,
           role: "⚡ 2. 高槓桿波段買方 (價外)",
           reason: `權利金成本較低 (${dist}點)，${sc.metaTag}，急殺放大快`
         });
       }
       // Hedge BC: +200 to +800 OTM (Cheap reversal protection)
       if (cEntry >= 15 && cEntry <= 900 && dist >= 200 && dist <= 800 && (s.callVol > 0 || s.callOi > 0)) {
-        const sc = scoreCandidate(43, 40, 25, s.callVol, s.callBid, s.callAsk, s.callBidP, s.callAskP, cEntry, s.strike, "BC", true);
+        const sc = scoreCandidate(44, 18, s.callVol, s.callOi, s.callChg, s.callBid, s.callAsk, s.callBidP, s.callAskP, cEntry, s.strike, "BC", true);
         hedgeCandidates.push({
           strike: s.strike, cp: "C", action: "BC", price: cEntry, vol: s.callVol, oi: s.callOi,
           winScore: sc.score,
+          breakdown: sc.breakdown,
           role: "🛡️ 3. 買方反轉保護單 (BC避險)",
           reason: `防軋空反轉 (+${dist}點)，${sc.metaTag}，買方勒式保護`
         });
@@ -2066,30 +2120,33 @@ function buildWeeklyAllocationRecommendations() {
     } else {
       // Core BC: ATM to +300 OTM
       if (cEntry >= 30 && cEntry <= 2200 && dist >= -100 && dist <= 300 && (s.callVol > 0 || s.callOi > 0)) {
-        const sc = scoreCandidate(48, 50, 30, s.callVol, s.callBid, s.callAsk, s.callBidP, s.callAskP, cEntry, s.strike, "BC", false);
+        const sc = scoreCandidate(48, 22, s.callVol, s.callOi, s.callChg, s.callBid, s.callAsk, s.callBidP, s.callAskP, cEntry, s.strike, "BC", false);
         coreCandidates.push({
           strike: s.strike, cp: "C", action: "BC", price: cEntry, vol: s.callVol, oi: s.callOi,
           winScore: sc.score,
+          breakdown: sc.breakdown,
           role: "🔥 1. 核心順勢買方 (近價平)",
           reason: `多方主導 (+${dist}點)，${sc.metaTag}，成交量 ${fmtNum(s.callVol)} 口`
         });
       }
       // Leverage BC: +400 to +1000 OTM
       if (cEntry >= 15 && cEntry <= 1200 && dist >= 400 && dist <= 1000 && (s.callVol > 0 || s.callOi > 0)) {
-        const sc = scoreCandidate(45, 40, 28, s.callVol, s.callBid, s.callAsk, s.callBidP, s.callAskP, cEntry, s.strike, "BC", false);
+        const sc = scoreCandidate(45, 20, s.callVol, s.callOi, s.callChg, s.callBid, s.callAsk, s.callBidP, s.callAskP, cEntry, s.strike, "BC", false);
         leverageCandidates.push({
           strike: s.strike, cp: "C", action: "BC", price: cEntry, vol: s.callVol, oi: s.callOi,
           winScore: sc.score,
+          breakdown: sc.breakdown,
           role: "⚡ 2. 高槓桿波段買方 (價外)",
           reason: `權利金成本較低 (+${dist}點)，${sc.metaTag}，突破放大快`
         });
       }
       // Hedge BP: -200 to -800 OTM
       if (pEntry >= 15 && pEntry <= 900 && dist <= -200 && dist >= -800 && (s.putVol > 0 || s.putOi > 0)) {
-        const sc = scoreCandidate(43, 40, 25, s.putVol, s.putBid, s.putAsk, s.putBidP, s.putAskP, pEntry, s.strike, "BP", true);
+        const sc = scoreCandidate(44, 18, s.putVol, s.putOi, s.putChg, s.putBid, s.putAsk, s.putBidP, s.putAskP, pEntry, s.strike, "BP", true);
         hedgeCandidates.push({
           strike: s.strike, cp: "P", action: "BP", price: pEntry, vol: s.putVol, oi: s.putOi,
           winScore: sc.score,
+          breakdown: sc.breakdown,
           role: "🛡️ 3. 買方反轉保護單 (BP避險)",
           reason: `防急殺回測 (${dist}點)，${sc.metaTag}，買方勒式保護`
         });
@@ -2597,7 +2654,8 @@ function renderSimTab() {
               <span style="color:#f87171">🎯 建議停利：<strong>${r.tpPrice.toFixed(1)} 點</strong> (+${r.tpPct}%)</span>
               <span style="color:#4ade80">🛡️ 建議停損：<strong>${r.slPrice.toFixed(1)} 點</strong> (-${r.slPct}%)</span>
             </div>
-            <div style="font-size:0.74rem;color:var(--muted);margin-bottom:8px">${escapeHtml(r.reason)}</div>
+            <div style="font-size:0.74rem;color:var(--muted);margin-bottom:4px">${escapeHtml(r.reason)}</div>
+            ${r.breakdown ? `<div style="font-size:0.68rem;color:#94a3b8;margin-bottom:8px;padding:3px 6px;border-radius:4px;background:rgba(15,23,42,0.55)">📊 信心度依據：${escapeHtml(r.breakdown)}</div>` : ''}
             <button class="btn" style="width:100%;justify-content:center;padding:5px;font-size:0.76rem" onclick="placeSimOrder(${r.strike},'${r.action}',${r.suggestedLots})">
               ⚡ 單筆下單 (${r.action} ${r.suggestedLots}口)
             </button>
