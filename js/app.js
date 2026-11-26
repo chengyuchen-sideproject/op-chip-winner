@@ -236,6 +236,31 @@ let TAIFEX_IS_FETCHING = false;
 let TAIFEX_DDL_CACHE = { marketType: "", epoch: 0, months: [] };
 let TAIFEX_DAY_OI_CACHE = { contract: "", epoch: 0, map: {} };
 const LIVE_CHIP_SNAPSHOTS = [];
+let PREV_STRIKE_QUOTE_SNAP = { contract: "", epoch: 0, map: {} };
+let LIVE_DECISION_METRICS = {
+  callTotalVol: 0,
+  putTotalVol: 0,
+  volPutCallRatio: 100,
+  callUpVol: 0,
+  callDnVol: 0,
+  putUpVol: 0,
+  putDnVol: 0,
+  recentCallFlow: 0,
+  recentPutFlow: 0,
+  recentAggressiveCallBuy: 0,
+  recentAggressivePutBuy: 0,
+  callBidDepthNear: 0,
+  callAskDepthNear: 0,
+  putBidDepthNear: 0,
+  putAskDepthNear: 0,
+  txfVsVwapPts: 0,
+  txfSlope3Bars: 0,
+  bullScore: 50,
+  bearScore: 50,
+  signalAction: "BC",
+  signalStrength: "中性震盪",
+  signalReasons: []
+};
 
 async function fetchLiveTaifexData() {
   if (CURRENT_SESSION_ID !== "LIVE_TAIFEX") return;
@@ -435,65 +460,114 @@ function buildLiveStrikeChainFromTaifex(optList, dayOiMap, spotPrice, contractNa
     }
     const row = strikeMap[k];
     const rawLast = Number(o.CLastPrice || 0);
-    const refP = Number(o.CRefPrice || rawLast || 0);
+    const refP = Number(o.CRefPrice || 0);
+    const openP = Number(o.COpenPrice || refP || rawLast || 0);
+    const highP = Number(o.CHighPrice || rawLast || 0);
+    const lowP = Number(o.CLowPrice || rawLast || 0);
     const bidSz = Number(o.CBestBidSize || o.CBidSize1 || 0);
     const askSz = Number(o.CBestAskSize || o.CAskSize1 || 0);
     const bidP = Number(o.CBestBidPrice || o.CBidPrice1 || 0);
     const askP = Number(o.CBestAskPrice || o.CAskPrice1 || 0);
-    let lastP = rawLast || refP;
-    const hasReasonableSpread = bidP > 0 && askP > 0 && askP >= bidP && ((askP - bidP) / Math.max(1, askP)) <= 0.12;
-    if (hasReasonableSpread) {
-      if (rawLast <= 0 || rawLast < bidP * 0.96 || rawLast > askP * 1.04) {
+    const vol = Number(o.CTotalVolume || 0);
+    const hasReasonableSpread = bidP > 0 && askP > 0 && askP >= bidP && ((askP - bidP) / Math.max(1, askP)) <= 0.15;
+    let lastP = rawLast > 0 ? rawLast : (hasReasonableSpread ? Math.round(((bidP + askP) / 2) * 10) / 10 : refP);
+    if (hasReasonableSpread && rawLast > 0) {
+      if (rawLast < bidP * 0.94 || rawLast > askP * 1.06) {
         lastP = Math.round(((bidP + askP) / 2) * 10) / 10;
       }
     }
-    // Sanity guard against flash order-book vacuum (e.g., MM pulls bids during sudden market spike):
-    // never let execution price deviate more than 8% from valid lastP unless lastP was 0
+    // Execution quote guard: only accept valid quote when volume > 0 or reasonable bid/ask exists
     const isBuyQuoteSane = askP > 0 && (lastP <= 0 || (Math.abs(askP - lastP) / lastP <= 0.08));
     const isSellQuoteSane = bidP > 0 && (lastP <= 0 || (Math.abs(lastP - bidP) / lastP <= 0.08));
     const execBuyP = isBuyQuoteSane ? askP : lastP;
     const execSellP = isSellQuoteSane ? bidP : lastP;
-    const chg = Math.round((lastP - refP) * 10) / 10;
-    const vol = Number(o.CTotalVolume || 0);
+    // IMPORTANT: If vol === 0 and rawLast === 0, do NOT report fake -refP crash!
+    const chg = (lastP > 0 && refP > 0 && (vol > 0 || rawLast > 0 || hasReasonableSpread))
+      ? Math.round((lastP - refP) * 10) / 10
+      : 0;
+    const intradayChg = (lastP > 0 && openP > 0 && vol > 0)
+      ? Math.round((lastP - openP) * 10) / 10
+      : chg;
     const oiKey = `${k}_${o.CP}`;
     const oi = Number(o.OpenInterest || dayOiMap[oiKey] || 0);
 
-    if (contractName && lastP > 0) {
-      CONTRACT_PRICE_CACHE[contractName][`${k}_${o.CP}`] = { price: lastP, execBuyP, execSellP, symbol: o.SymbolID || "", bidP, askP };
+    // Track real tick-by-tick ΔVol & aggressive outer-盘 (Ask-hit) vs inner-盘 (Bid-hit) flow
+    const prevMap = (PREV_STRIKE_QUOTE_SNAP.contract === contractName) ? PREV_STRIKE_QUOTE_SNAP.map : {};
+    const prevItem = prevMap[oiKey];
+    let deltaVol = 0;
+    let tickSign = 0; // +1 = buyer initiated (at Ask or price up), -1 = seller initiated (at Bid or price down)
+    if (prevItem && vol >= prevItem.vol) {
+      deltaVol = vol - prevItem.vol;
+      if (deltaVol > 0) {
+        if (rawLast > prevItem.lastP || (prevItem.askP > 0 && rawLast >= prevItem.askP)) tickSign = 1;
+        else if (rawLast < prevItem.lastP || (prevItem.bidP > 0 && rawLast <= prevItem.bidP)) tickSign = -1;
+        else tickSign = chg >= 0 ? 1 : -1;
+      } else {
+        deltaVol = prevItem.deltaVol || 0;
+        tickSign = prevItem.tickSign || 0;
+      }
     }
+
+    if (contractName && lastP > 0) {
+      CONTRACT_PRICE_CACHE[contractName][`${k}_${o.CP}`] = {
+        price: lastP, execBuyP, execSellP, symbol: o.SymbolID || "", bidP, askP, vol, openP, highP, lowP
+      };
+    }
+
+    // Continuous intraday pressure score (-1.0 to +1.0) combining vs-Ref, vs-Open, High-Low position, and Bid/Ask imbalance
+    const rangeSpan = Math.max(1, highP - lowP);
+    const hlPos = (vol > 0 && highP > lowP) ? (((lastP - lowP) / rangeSpan) * 2 - 1) : 0; // -1 at Low, +1 at High
+    const refRatio = refP > 0 ? Math.max(-1, Math.min(1, (chg / Math.max(5, refP * 0.18)))) : 0;
+    const openRatio = openP > 0 ? Math.max(-1, Math.min(1, (intradayChg / Math.max(5, openP * 0.15)))) : refRatio;
+    const obRatio = (bidSz + askSz) > 0 ? ((bidSz - askSz) / (bidSz + askSz)) : 0;
+    const compositeDir = (vol > 0)
+      ? Math.max(-1, Math.min(1, refRatio * 0.45 + openRatio * 0.25 + hlPos * 0.15 + obRatio * 0.15))
+      : 0;
 
     if (o.CP === "C") {
       row.callSymbol = o.SymbolID || "";
       row.callPrice = lastP;
+      row.callOpen = openP;
+      row.callHigh = highP;
+      row.callLow = lowP;
       row.callExecBuyP = execBuyP;
       row.callExecSellP = execSellP;
       row.callRef = refP;
       row.callChg = chg;
+      row.callIntradayChg = intradayChg;
       row.callVol = vol;
+      row.callDeltaVol = deltaVol;
+      row.callTickSign = tickSign;
+      row.callDirScore = compositeDir;
       row.callOi = oi;
       row.callBid = bidSz;
       row.callAsk = askSz;
       row.callBidP = bidP;
       row.callAskP = askP;
-      // Price up or bid-heavy on Call = BC (買進買權); Price down or ask-heavy = SC (賣出買權)
-      row.callAction = (chg > 0 || (chg === 0 && bidSz > askSz)) ? "BC" : "SC";
-      row.callOiDelta = bidSz - askSz; // Real 5-level BestBid - BestAsk imbalance
+      row.callAction = (compositeDir > 0.05 || (chg > 0 && compositeDir >= -0.05)) ? "BC" : "SC";
+      row.callOiDelta = bidSz - askSz;
     } else if (o.CP === "P") {
       row.putSymbol = o.SymbolID || "";
       row.putPrice = lastP;
+      row.putOpen = openP;
+      row.putHigh = highP;
+      row.putLow = lowP;
       row.putExecBuyP = execBuyP;
       row.putExecSellP = execSellP;
       row.putRef = refP;
       row.putChg = chg;
+      row.putIntradayChg = intradayChg;
       row.putVol = vol;
+      row.putDeltaVol = deltaVol;
+      row.putTickSign = tickSign;
+      row.putDirScore = compositeDir;
       row.putOi = oi;
       row.putBid = bidSz;
       row.putAsk = askSz;
       row.putBidP = bidP;
       row.putAskP = askP;
-      // Price up or bid-heavy on Put = BP (買進賣權); Price down or ask-heavy = SP (賣出賣權)
-      row.putAction = (chg > 0 || (chg === 0 && bidSz > askSz)) ? "BP" : "SP";
-      row.putOiDelta = bidSz - askSz; // Real 5-level BestBid - BestAsk imbalance
+      row.putAction = (compositeDir > 0.05 || (chg > 0 && compositeDir >= -0.05)) ? "BP" : "SP";
+      row.putOiDelta = bidSz - askSz;
     }
   });
 
@@ -502,14 +576,46 @@ function buildLiveStrikeChainFromTaifex(optList, dayOiMap, spotPrice, contractNa
   let maxCallOi = -1, callWallStrike = atmStrike + 300;
   let maxPutOi = -1, putWallStrike = atmStrike - 300;
   let totalCallOi = 0, totalPutOi = 0;
+  let totalCallVol = 0, totalPutVol = 0;
+  let callUpVol = 0, callDnVol = 0, putUpVol = 0, putDnVol = 0;
+  let recentCallFlow = 0, recentPutFlow = 0;
+  let recentAggressiveCallBuy = 0, recentAggressivePutBuy = 0;
+  let callBidDepthNear = 0, callAskDepthNear = 0, putBidDepthNear = 0, putAskDepthNear = 0;
   let totalCallNetForce = 0; // >0 BC, <0 SC
   let totalPutNetForce = 0;  // >0 BP, <0 SP
+  const nextSnapMap = {};
 
   allStrikes.forEach(s => {
     const cWeight = s.callOi > 0 ? s.callOi : s.callVol;
     const pWeight = s.putOi > 0 ? s.putOi : s.putVol;
     totalCallOi += cWeight;
     totalPutOi += pWeight;
+    totalCallVol += (s.callVol || 0);
+    totalPutVol += (s.putVol || 0);
+    if (s.callChg > 0) callUpVol += s.callVol;
+    else if (s.callChg < 0) callDnVol += s.callVol;
+    if (s.putChg > 0) putUpVol += s.putVol;
+    else if (s.putChg < 0) putDnVol += s.putVol;
+
+    if (Math.abs(s.strike - atmStrike) <= 800) {
+      callBidDepthNear += (s.callBid || 0);
+      callAskDepthNear += (s.callAsk || 0);
+      putBidDepthNear += (s.putBid || 0);
+      putAskDepthNear += (s.putAsk || 0);
+    }
+
+    const cDeltaV = s.callDeltaVol || 0;
+    const pDeltaV = s.putDeltaVol || 0;
+    const cSign = s.callTickSign || (s.callChg >= 0 ? 1 : -1);
+    const pSign = s.putTickSign || (s.putChg >= 0 ? 1 : -1);
+    recentCallFlow += cDeltaV * cSign;
+    recentPutFlow += pDeltaV * pSign;
+    if (cSign > 0) recentAggressiveCallBuy += cDeltaV;
+    if (pSign > 0) recentAggressivePutBuy += pDeltaV;
+
+    nextSnapMap[`${s.strike}_C`] = { vol: s.callVol || 0, lastP: s.callPrice || 0, bidP: s.callBidP || 0, askP: s.callAskP || 0, deltaVol: cDeltaV, tickSign: cSign };
+    nextSnapMap[`${s.strike}_P`] = { vol: s.putVol || 0, lastP: s.putPrice || 0, bidP: s.putBidP || 0, askP: s.putAskP || 0, deltaVol: pDeltaV, tickSign: pSign };
+
     // For Call/Put walls, Call Wall is overhead resistance (>= atmStrike - 100 within +2500) and Put Wall is downside support (<= atmStrike + 100 within -2500)
     if ((s.strike >= atmStrike - 100 && s.strike <= atmStrike + 2500) || maxCallOi < 0) {
       if (cWeight > maxCallOi) { maxCallOi = cWeight; callWallStrike = s.strike; }
@@ -518,11 +624,36 @@ function buildLiveStrikeChainFromTaifex(optList, dayOiMap, spotPrice, contractNa
       if (pWeight > maxPutOi) { maxPutOi = pWeight; putWallStrike = s.strike; }
     }
 
-    const cDir = s.callChg > 0 ? 1 : (s.callChg < 0 ? -1 : (s.callBid >= s.callAsk ? 0.3 : -0.3));
-    const pDir = s.putChg > 0 ? 1 : (s.putChg < 0 ? -1 : (s.putBid >= s.putAsk ? 0.3 : -0.3));
+    // Continuous pressure-weighted volume force (prevents binary +1/-1 distortion on 0.5pt ticks)
+    const cDir = typeof s.callDirScore === "number"
+      ? (Math.abs(s.callDirScore) >= 0.08 ? Math.sign(s.callDirScore) * Math.max(0.35, Math.abs(s.callDirScore)) : (s.callChg > 0 ? 0.6 : (s.callChg < 0 ? -0.6 : 0)))
+      : (s.callChg > 0 ? 1 : (s.callChg < 0 ? -1 : 0));
+    const pDir = typeof s.putDirScore === "number"
+      ? (Math.abs(s.putDirScore) >= 0.08 ? Math.sign(s.putDirScore) * Math.max(0.35, Math.abs(s.putDirScore)) : (s.putChg > 0 ? 0.6 : (s.putChg < 0 ? -0.6 : 0)))
+      : (s.putChg > 0 ? 1 : (s.putChg < 0 ? -1 : 0));
     totalCallNetForce += Math.round(s.callVol * cDir);
     totalPutNetForce += Math.round(s.putVol * pDir);
   });
+
+  if (contractName) {
+    PREV_STRIKE_QUOTE_SNAP = { contract: contractName, epoch: Date.now(), map: nextSnapMap };
+  }
+
+  LIVE_DECISION_METRICS.callTotalVol = totalCallVol;
+  LIVE_DECISION_METRICS.putTotalVol = totalPutVol;
+  LIVE_DECISION_METRICS.volPutCallRatio = Math.round((totalPutVol / Math.max(1, totalCallVol)) * 1000) / 10;
+  LIVE_DECISION_METRICS.callUpVol = callUpVol;
+  LIVE_DECISION_METRICS.callDnVol = callDnVol;
+  LIVE_DECISION_METRICS.putUpVol = putUpVol;
+  LIVE_DECISION_METRICS.putDnVol = putDnVol;
+  LIVE_DECISION_METRICS.recentCallFlow = recentCallFlow;
+  LIVE_DECISION_METRICS.recentPutFlow = recentPutFlow;
+  LIVE_DECISION_METRICS.recentAggressiveCallBuy = recentAggressiveCallBuy;
+  LIVE_DECISION_METRICS.recentAggressivePutBuy = recentAggressivePutBuy;
+  LIVE_DECISION_METRICS.callBidDepthNear = callBidDepthNear;
+  LIVE_DECISION_METRICS.callAskDepthNear = callAskDepthNear;
+  LIVE_DECISION_METRICS.putBidDepthNear = putBidDepthNear;
+  LIVE_DECISION_METRICS.putAskDepthNear = putAskDepthNear;
 
   // Max Pain calculation across active strikes
   const activeForPain = allStrikes.filter(s => (s.callOi + s.putOi + s.callVol + s.putVol) > 0);
@@ -1250,8 +1381,83 @@ function drawOiWallChart(canvasId, chain) {
 // ============================================================================
 // Dynamic Real-Time Chip Strategy Advice Engine
 // ============================================================================
+function computeCallPutDecisionMatrix(lastBar, chain) {
+  if (!lastBar || !chain) return LIVE_DECISION_METRICS;
+  const m = LIVE_DECISION_METRICS;
+  const price = lastBar.close;
+  const vwap = lastBar.greenMidCost;
+  const prevBar = ACTIVE_BARS[Math.max(0, ACTIVE_BARS.length - 4)] || lastBar;
+  const priceSlope = price - prevBar.close;
+  const vwapDiff = price - vwap;
+  m.txfVsVwapPts = Math.round(vwapDiff);
+  m.txfSlope3Bars = Math.round(priceSlope);
+
+  // 1. CP Net Force Score (-20 to +20)
+  const totalVol = Math.max(1, m.callTotalVol + m.putTotalVol);
+  const cpRatio = lastBar.cpDiffVal / totalVol; // -1.0 to +1.0
+  const cpScore = Math.max(-20, Math.min(20, Math.round(cpRatio * 28)));
+
+  // 2. Real-time Tick Flow & Aggressive Ask-Hit Score (-15 to +15)
+  const netRecentFlow = (m.recentCallFlow || 0) - (m.recentPutFlow || 0);
+  const flowScore = netRecentFlow !== 0
+    ? Math.max(-15, Math.min(15, Math.round(Math.sign(netRecentFlow) * Math.min(15, Math.log2(Math.abs(netRecentFlow) + 1) * 2.5))))
+    : 0;
+
+  // 3. TXF Price vs VWAP & Cost Bands (-15 to +15)
+  let vwapScore = 0;
+  if (price >= lastBar.redBullCost && price >= vwap) vwapScore = 15;
+  else if (price >= vwap) vwapScore = 8;
+  else if (price <= lastBar.blueBearCost && price <= vwap) vwapScore = -15;
+  else vwapScore = -8;
+
+  // 4. Short-term 3-bar Momentum & Live Snapshot Slope (-10 to +10)
+  let slopeScore = priceSlope > 15 ? 7 : (priceSlope > 0 ? 3 : (priceSlope < -15 ? -7 : (priceSlope < 0 ? -3 : 0)));
+  if (LIVE_CHIP_SNAPSHOTS.length >= 2) {
+    const sFirst = LIVE_CHIP_SNAPSHOTS[Math.max(0, LIVE_CHIP_SNAPSHOTS.length - 4)];
+    const sLast = LIVE_CHIP_SNAPSHOTS[LIVE_CHIP_SNAPSHOTS.length - 1];
+    const dCp = sLast.cpDiff - sFirst.cpDiff;
+    if (dCp > 50) slopeScore += 3;
+    else if (dCp < -50) slopeScore -= 3;
+  }
+
+  // 5. Near-ATM Option Order-Book Bid/Ask Imbalance & OI P/C Ratio (-10 to +10)
+  const cImb = (m.callBidDepthNear - m.callAskDepthNear) / Math.max(1, m.callBidDepthNear + m.callAskDepthNear);
+  const pImb = (m.putBidDepthNear - m.putAskDepthNear) / Math.max(1, m.putBidDepthNear + m.putAskDepthNear);
+  const obScore = Math.max(-6, Math.min(6, Math.round((cImb - pImb) * 8)));
+  const pcScore = chain.calcPcRatio >= 110 ? 4 : (chain.calcPcRatio <= 88 ? -4 : 0);
+
+  const rawNet = cpScore + flowScore + vwapScore + slopeScore + obScore + pcScore; // -70 to +70
+  const bullPct = Math.max(8, Math.min(92, Math.round(50 + rawNet * 0.65)));
+  const bearPct = 100 - bullPct;
+
+  m.bullScore = bullPct;
+  m.bearScore = bearPct;
+  m.signalAction = bullPct >= 50 ? "BC" : "BP";
+  const maxPct = Math.max(bullPct, bearPct);
+  if (lastBar.callVal < 0 && lastBar.putVal < 0 && maxPct < 62) {
+    m.signalStrength = "⚖️ 莊家雙賣盤整 (觀望/小量價差)";
+  } else if (maxPct >= 75) {
+    m.signalStrength = bullPct >= 50 ? "🔥 強烈建議買進 CALL (BC 順勢強多)" : "🔥 強烈建議買進 PUT (BP 順勢強空)";
+  } else if (maxPct >= 60) {
+    m.signalStrength = bullPct >= 50 ? "📈 偏多建議買進 CALL (BC 順勢操作)" : "📉 偏空建議買進 PUT (BP 順勢操作)";
+  } else {
+    m.signalStrength = bullPct >= 50 ? "↗️ 微幅偏多 (拉回支撐買 CALL)" : "↘️ 微幅偏空 (反彈壓力買 PUT)";
+  }
+
+  const reasons = [];
+  reasons.push(`CP淨差額 ${fmtSigned(lastBar.cpDiffVal)} 口 (Call上漲量 ${fmtNum(m.callUpVol)}口 vs Put上漲量 ${fmtNum(m.putUpVol)}口)`);
+  reasons.push(`台指期 ${fmtNum(price)} 點 (${vwapDiff >= 0 ? '站上' : '跌破'} VWAP 均價線 ${fmtSigned(Math.round(vwapDiff))} 點，近3根K線 ${fmtSigned(Math.round(priceSlope))} 點)`);
+  if (m.recentAggressiveCallBuy > 0 || m.recentAggressivePutBuy > 0) {
+    reasons.push(`最新6秒即時跳動增量：Call外盤追買 +${fmtNum(m.recentAggressiveCallBuy)}口 vs Put外盤追買 +${fmtNum(m.recentAggressivePutBuy)}口`);
+  }
+  reasons.push(`近價平委買/委賣掛單比：Call ${m.callBidDepthNear}/${m.callAskDepthNear}口 ｜ Put ${m.putBidDepthNear}/${m.putAskDepthNear}口 ｜ 未平倉 P/C ${chain.calcPcRatio}%`);
+  m.signalReasons = reasons;
+  return m;
+}
+
 function buildChipAdviceHtml(lastBar, chain) {
   if (!lastBar || !chain) return "";
+  const dm = computeCallPutDecisionMatrix(lastBar, chain);
   const cp = lastBar.cpDiffVal;
   const cVal = lastBar.callVal;
   const pVal = lastBar.putVal;
@@ -1297,6 +1503,30 @@ function buildChipAdviceHtml(lastBar, chain) {
 
   return `
     <div class="advice-card">
+      <!-- Real-Time CALL vs PUT Buying Decision Meter -->
+      <div style="background:rgba(15,23,42,0.85);border:1px solid rgba(56,189,248,0.35);border-radius:10px;padding:12px 14px;margin-bottom:12px">
+        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:8px">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <span style="font-size:0.95rem;font-weight:800;color:#fde047">🎯 即時買方決策雷達 (Buy CALL vs Buy PUT)：</span>
+            <span class="op-badge ${dm.bullScore >= 50 ? 'badge-bc' : 'badge-bp'}" style="font-size:0.82rem;padding:3px 10px">${escapeHtml(dm.signalStrength)}</span>
+          </div>
+          <div style="font-size:0.76rem;color:#cbd5e1">
+            當盤總成交量：🔴 Call <strong>${fmtNum(dm.callTotalVol)}</strong>口 (漲 ${fmtNum(dm.callUpVol)} / 跌 ${fmtNum(dm.callDnVol)}) ｜ 🔵 Put <strong>${fmtNum(dm.putTotalVol)}</strong>口 (漲 ${fmtNum(dm.putUpVol)} / 跌 ${fmtNum(dm.putDnVol)}) ｜ 量比 P/C <strong>${dm.volPutCallRatio}%</strong>
+          </div>
+        </div>
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
+          <span style="font-size:0.8rem;font-weight:800;color:#f87171;min-width:95px">🔴 買 CALL ${dm.bullScore}%</span>
+          <div style="flex:1;height:12px;background:#1e293b;border-radius:99px;overflow:hidden;display:flex;border:1px solid rgba(148,163,184,0.25)">
+            <div style="width:${dm.bullScore}%;background:linear-gradient(90deg,#dc2626,#f87171);transition:width 0.3s"></div>
+            <div style="width:${dm.bearScore}%;background:linear-gradient(90deg,#60a5fa,#2563eb);transition:width 0.3s"></div>
+          </div>
+          <span style="font-size:0.8rem;font-weight:800;color:#60a5fa;min-width:95px;text-align:right">🔵 買 PUT ${dm.bearScore}%</span>
+        </div>
+        <div style="font-size:0.74rem;color:#94a3b8;line-height:1.5">
+          📌 <strong>即時判讀依據：</strong>${dm.signalReasons.map(r => escapeHtml(r)).join(" ｜ ")}
+        </div>
+      </div>
+
       <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
         <div style="font-size:0.98rem;font-weight:800;color:#fff">💡 目前籌碼實戰操作建議：${escapeHtml(postureTitle)}</div>
         ${postureBadge}
@@ -1948,12 +2178,13 @@ function buildWeeklyAllocationRecommendations() {
   if (!chain || !chain.strikes.length || !lastBar) return [];
 
   const atm = chain.atmStrike;
+  const dm = computeCallPutDecisionMatrix(lastBar, chain);
   const cVal = lastBar.callVal;
   const pVal = lastBar.putVal;
   // Detect Seller Range-Pin Regime (SC + SP: both Call and Put below zero axis)
   const isDoubleSellRange = cVal < 0 && pVal < 0;
-  // Determine dominant bull/bear direction directly from Green Line (CP Diff = CallVal - PutVal)
-  const isBull = lastBar.cpDiffVal >= 0;
+  // Determine dominant bull/bear direction from multi-factor Call/Put Decision Matrix (CP Force + VWAP + Real-time Flow + OB Imbalance)
+  const isBull = dm.bullScore >= 50;
   const mainAct = isBull ? "BC" : "BP";
   const singleWingAttack = isBull ? (cVal >= 0 && pVal <= 0) : (pVal >= 0 && cVal <= 0);
   const cpStrengthBonus = Math.min(4, Math.floor(Math.abs(lastBar.cpDiffVal) / 15000)) + (singleWingAttack ? 2 : 0);
@@ -1997,7 +2228,7 @@ function buildWeeklyAllocationRecommendations() {
     .sort((a, b) => b - a);
   const refHighVol = Math.max(250, activeVols[Math.min(2, Math.max(0, activeVols.length - 1))] || 1200);
 
-  const scoreCandidate = (baseScore, volCap, vol, oi, chg, bidSz, askSz, bidP, askP, price, strike, act, isHedge) => {
+  const scoreCandidate = (baseScore, volCap, vol, oi, chg, intradayChg, deltaVol, tickSign, bidSz, askSz, bidP, askP, price, strike, act, isHedge) => {
     if (vol < 10) {
       return { score: 0, metaTag: "成交量不足" };
     }
@@ -2006,11 +2237,12 @@ function buildWeeklyAllocationRecommendations() {
     const oiBonus = Math.min(3, Math.round(Math.log10((oi || 0) + 1)));
     const volScore = Math.min(volCap, Math.round(relVolRatio * (volCap - 3)) + oiBonus);
 
-    // 2. Order Book & Premium Momentum (0 ~ 8 pts)
+    // 2. Order Book, Intraday Expansion & Real-time Tick Burst (0 ~ 11 pts)
     const imbRatio = (bidSz - askSz) / Math.max(1, bidSz + askSz);
     const imbScore = Math.round((imbRatio + 1) * 2.5); // 0 ~ 5 pts
-    const chgScore = chg > 0 ? 3 : (chg === 0 ? 1 : -2);
-    const bidAskBonus = imbScore + chgScore;
+    const chgScore = (chg > 0 && intradayChg >= 0) ? 4 : (chg > 0 || intradayChg > 0 ? 2 : (chg === 0 ? 1 : -2));
+    const burstScore = (deltaVol >= 5 && tickSign > 0) ? 2 : ((deltaVol > 0 && tickSign > 0) ? 1 : ((deltaVol >= 5 && tickSign < 0) ? -2 : 0));
+    const bidAskBonus = imbScore + chgScore + burstScore;
 
     // 3. Continuous Bid-Ask Spread Cost Score (-12 ~ +6 pts)
     let spreadBonus = 0;
@@ -2091,7 +2323,7 @@ function buildWeeklyAllocationRecommendations() {
     if (mainAct === "BP") {
       // Core BP: ATM to -300 OTM (High Delta)
       if (pEntry >= 30 && pEntry <= 2200 && dist <= 100 && dist >= -300 && (s.putVol > 0 || s.putOi > 0)) {
-        const sc = scoreCandidate(48, 22, s.putVol, s.putOi, s.putChg, s.putBid, s.putAsk, s.putBidP, s.putAskP, pEntry, s.strike, "BP", false);
+        const sc = scoreCandidate(48, 22, s.putVol, s.putOi, s.putChg, s.putIntradayChg || 0, s.putDeltaVol || 0, s.putTickSign || 0, s.putBid, s.putAsk, s.putBidP, s.putAskP, pEntry, s.strike, "BP", false);
         coreCandidates.push({
           strike: s.strike, cp: "P", action: "BP", price: pEntry, vol: s.putVol, oi: s.putOi,
           winScore: sc.score,
@@ -2102,7 +2334,7 @@ function buildWeeklyAllocationRecommendations() {
       }
       // Leverage BP: -400 to -1000 OTM (Lower premium, high Gamma leverage)
       if (pEntry >= 15 && pEntry <= 1200 && dist <= -400 && dist >= -1000 && (s.putVol > 0 || s.putOi > 0)) {
-        const sc = scoreCandidate(45, 20, s.putVol, s.putOi, s.putChg, s.putBid, s.putAsk, s.putBidP, s.putAskP, pEntry, s.strike, "BP", false);
+        const sc = scoreCandidate(45, 20, s.putVol, s.putOi, s.putChg, s.putIntradayChg || 0, s.putDeltaVol || 0, s.putTickSign || 0, s.putBid, s.putAsk, s.putBidP, s.putAskP, pEntry, s.strike, "BP", false);
         leverageCandidates.push({
           strike: s.strike, cp: "P", action: "BP", price: pEntry, vol: s.putVol, oi: s.putOi,
           winScore: sc.score,
@@ -2113,7 +2345,7 @@ function buildWeeklyAllocationRecommendations() {
       }
       // Hedge BC: +200 to +800 OTM (Cheap reversal protection)
       if (cEntry >= 15 && cEntry <= 900 && dist >= 200 && dist <= 800 && (s.callVol > 0 || s.callOi > 0)) {
-        const sc = scoreCandidate(44, 18, s.callVol, s.callOi, s.callChg, s.callBid, s.callAsk, s.callBidP, s.callAskP, cEntry, s.strike, "BC", true);
+        const sc = scoreCandidate(44, 18, s.callVol, s.callOi, s.callChg, s.callIntradayChg || 0, s.callDeltaVol || 0, s.callTickSign || 0, s.callBid, s.callAsk, s.callBidP, s.callAskP, cEntry, s.strike, "BC", true);
         hedgeCandidates.push({
           strike: s.strike, cp: "C", action: "BC", price: cEntry, vol: s.callVol, oi: s.callOi,
           winScore: sc.score,
@@ -2125,7 +2357,7 @@ function buildWeeklyAllocationRecommendations() {
     } else {
       // Core BC: ATM to +300 OTM
       if (cEntry >= 30 && cEntry <= 2200 && dist >= -100 && dist <= 300 && (s.callVol > 0 || s.callOi > 0)) {
-        const sc = scoreCandidate(48, 22, s.callVol, s.callOi, s.callChg, s.callBid, s.callAsk, s.callBidP, s.callAskP, cEntry, s.strike, "BC", false);
+        const sc = scoreCandidate(48, 22, s.callVol, s.callOi, s.callChg, s.callIntradayChg || 0, s.callDeltaVol || 0, s.callTickSign || 0, s.callBid, s.callAsk, s.callBidP, s.callAskP, cEntry, s.strike, "BC", false);
         coreCandidates.push({
           strike: s.strike, cp: "C", action: "BC", price: cEntry, vol: s.callVol, oi: s.callOi,
           winScore: sc.score,
@@ -2136,7 +2368,7 @@ function buildWeeklyAllocationRecommendations() {
       }
       // Leverage BC: +400 to +1000 OTM
       if (cEntry >= 15 && cEntry <= 1200 && dist >= 400 && dist <= 1000 && (s.callVol > 0 || s.callOi > 0)) {
-        const sc = scoreCandidate(45, 20, s.callVol, s.callOi, s.callChg, s.callBid, s.callAsk, s.callBidP, s.callAskP, cEntry, s.strike, "BC", false);
+        const sc = scoreCandidate(45, 20, s.callVol, s.callOi, s.callChg, s.callIntradayChg || 0, s.callDeltaVol || 0, s.callTickSign || 0, s.callBid, s.callAsk, s.callBidP, s.callAskP, cEntry, s.strike, "BC", false);
         leverageCandidates.push({
           strike: s.strike, cp: "C", action: "BC", price: cEntry, vol: s.callVol, oi: s.callOi,
           winScore: sc.score,
@@ -2147,7 +2379,7 @@ function buildWeeklyAllocationRecommendations() {
       }
       // Hedge BP: -200 to -800 OTM
       if (pEntry >= 15 && pEntry <= 900 && dist <= -200 && dist >= -800 && (s.putVol > 0 || s.putOi > 0)) {
-        const sc = scoreCandidate(44, 18, s.putVol, s.putOi, s.putChg, s.putBid, s.putAsk, s.putBidP, s.putAskP, pEntry, s.strike, "BP", true);
+        const sc = scoreCandidate(44, 18, s.putVol, s.putOi, s.putChg, s.putIntradayChg || 0, s.putDeltaVol || 0, s.putTickSign || 0, s.putBid, s.putAsk, s.putBidP, s.putAskP, pEntry, s.strike, "BP", true);
         hedgeCandidates.push({
           strike: s.strike, cp: "P", action: "BP", price: pEntry, vol: s.putVol, oi: s.putOi,
           winScore: sc.score,
@@ -2601,6 +2833,8 @@ function renderSimTab() {
   const whatIfPnl = calcTotalExpirationPnl(SIM_FORM.whatIfSettle);
 
   const recs = buildWeeklyAllocationRecommendations();
+  const lastBar = ACTIVE_BARS[ACTIVE_BARS.length - 1];
+  const dm = computeCallPutDecisionMatrix(lastBar, chain);
 
   container.innerHTML = `
     <!-- Account Summary KPIs -->
@@ -2649,6 +2883,27 @@ function renderSimTab() {
 
     <!-- AI Percentage-Based Weekly Options Recommendation & Auto-Trade Panel -->
     <div class="advice-card">
+      <!-- Live CALL vs PUT Decision Bar inside Simulation Tab -->
+      <div style="background:rgba(15,23,42,0.85);border:1px solid rgba(56,189,248,0.35);border-radius:10px;padding:10px 12px;margin-bottom:12px">
+        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px;margin-bottom:6px">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <span style="font-size:0.88rem;font-weight:800;color:#fde047">🎯 即時多空購買風向 (CALL vs PUT)：</span>
+            <span class="op-badge ${dm.bullScore >= 50 ? 'badge-bc' : 'badge-bp'}" style="font-size:0.78rem">${escapeHtml(dm.signalStrength)}</span>
+          </div>
+          <span style="font-size:0.74rem;color:#cbd5e1">
+            🔴 Call量 <strong>${fmtNum(dm.callTotalVol)}</strong>口 (漲 ${fmtNum(dm.callUpVol)}) ｜ 🔵 Put量 <strong>${fmtNum(dm.putTotalVol)}</strong>口 (漲 ${fmtNum(dm.putUpVol)}) ｜ 量比 P/C <strong>${dm.volPutCallRatio}%</strong>
+          </span>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px">
+          <span style="font-size:0.76rem;font-weight:800;color:#f87171;min-width:85px">🔴 買 CALL ${dm.bullScore}%</span>
+          <div style="flex:1;height:10px;background:#1e293b;border-radius:99px;overflow:hidden;display:flex">
+            <div style="width:${dm.bullScore}%;background:linear-gradient(90deg,#dc2626,#f87171)"></div>
+            <div style="width:${dm.bearScore}%;background:linear-gradient(90deg,#60a5fa,#2563eb)"></div>
+          </div>
+          <span style="font-size:0.76rem;font-weight:800;color:#60a5fa;min-width:85px;text-align:right">🔵 買 PUT ${dm.bearScore}%</span>
+        </div>
+      </div>
+
       <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">
         <div>
           <div style="font-size:1rem;font-weight:800;color:#fff">🤖 週選百分比購買推薦 & 自動化模擬操盤（目標合約：${escapeHtml(TAIFEX_EXPIRE_MONTH || '近週選')}）</div>
