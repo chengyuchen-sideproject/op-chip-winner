@@ -2367,9 +2367,30 @@ function saveSimState() {
   } catch (e) {}
 }
 
-function resetSimAccount() {
-  SIM_STATE = { initialCapital: 500000, cash: 500000, realizedPnl: 0, positions: [], history: [] };
+function resetSimAccount(customCap) {
+  const cap = Math.max(10000, Math.round(Number(customCap || SIM_STATE.initialCapital || 500000)));
+  SIM_STATE = { initialCapital: cap, cash: cap, realizedPnl: 0, positions: [], history: [] };
   saveSimState();
+  renderSimTab();
+}
+
+function setSimInitialCapital(newCapInput, shouldResetAll = false) {
+  const n = Math.round(Number(newCapInput));
+  if (!Number.isFinite(n) || n < 10000) {
+    alert("請輸入有效的起始金額（最低 NT$ 10,000）！");
+    return;
+  }
+  if (shouldResetAll) {
+    resetSimAccount(n);
+    SIM_LAST_AUTO_MSG = `💰 已將模擬起始金額重置為 NT$ ${fmtNum(n)}，並清空持倉與歷史紀錄。`;
+  } else {
+    const oldCap = SIM_STATE.initialCapital || 500000;
+    const diff = n - oldCap;
+    SIM_STATE.initialCapital = n;
+    SIM_STATE.cash = Math.max(0, SIM_STATE.cash + diff);
+    saveSimState();
+    SIM_LAST_AUTO_MSG = `💰 已將模擬起始金額調整為 NT$ ${fmtNum(n)}（可用餘額同步${diff >= 0 ? '增加' : '減少'} NT$ ${fmtNum(Math.abs(diff))}）。`;
+  }
   renderSimTab();
 }
 
@@ -2585,9 +2606,27 @@ function renderSimTab() {
     <!-- Account Summary KPIs -->
     <div class="kpi-grid">
       <div class="kpi-card">
-        <div class="kpi-label"><span>💰 模擬總權益數</span><button class="btn" style="padding:2px 8px;font-size:0.7rem" onclick="resetSimAccount()">🔄 重置50萬</button></div>
+        <div class="kpi-label">
+          <span>💰 模擬總權益數</span>
+          <button class="btn" style="padding:2px 8px;font-size:0.7rem" onclick="resetSimAccount()">🔄 重置 (${Math.round((SIM_STATE.initialCapital || 500000) / 10000)}萬)</button>
+        </div>
         <div class="kpi-val" style="color:#fde047">NT$ ${fmtNum(totalEquity)}</div>
-        <div class="kpi-sub">可用餘額: <strong>NT$ ${fmtNum(SIM_STATE.cash)}</strong></div>
+        <div class="kpi-sub">可用餘額: <strong>NT$ ${fmtNum(SIM_STATE.cash)}</strong> ｜ 起始本金: <strong>NT$ ${fmtNum(SIM_STATE.initialCapital || 500000)}</strong></div>
+        <div style="margin-top:8px;padding-top:8px;border-top:1px dashed rgba(148,163,184,0.25);display:flex;flex-direction:column;gap:6px">
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:6px;flex-wrap:wrap">
+            <span style="font-size:0.72rem;color:#cbd5e1;font-weight:700">⚙️ 調整起始本金：</span>
+            <div style="display:flex;gap:4px;flex-wrap:wrap">
+              ${[100000, 300000, 500000, 1000000, 2000000].map(amt => `
+                <button class="btn ${(SIM_STATE.initialCapital || 500000) === amt ? 'active' : ''}" style="padding:2px 6px;font-size:0.68rem" onclick="setSimInitialCapital(${amt}, false)">${amt / 10000}萬</button>
+              `).join("")}
+            </div>
+          </div>
+          <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+            <input id="simInitCapInput" type="number" min="10000" step="10000" value="${SIM_STATE.initialCapital || 500000}" class="select-input" style="flex:1;min-width:110px;padding:4px 8px;font-size:0.76rem;color:#fde047;font-weight:700" placeholder="輸入起始本金 (NT$)">
+            <button class="btn btn-teal" style="padding:4px 10px;font-size:0.72rem" onclick="setSimInitialCapital(document.getElementById('simInitCapInput').value, false)">套用本金</button>
+            <button class="btn" style="padding:4px 10px;font-size:0.72rem" onclick="setSimInitialCapital(document.getElementById('simInitCapInput').value, true)">套用並重置帳戶</button>
+          </div>
+        </div>
       </div>
       <div class="kpi-card">
         <div class="kpi-label"><span>📈 未實現浮動損益</span><span>${SIM_STATE.positions.length} 筆持倉</span></div>
