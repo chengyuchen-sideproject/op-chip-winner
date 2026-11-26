@@ -203,6 +203,7 @@ function formatTaifexTime(tStr) {
 
 let IS_USER_INTERACTING = false;
 let INTERACT_TIMER = null;
+let STRIKE_MODAL_TOKEN = 0;
 
 function isUserInteractingWithForm() {
   if (IS_USER_INTERACTING) return true;
@@ -271,7 +272,10 @@ async function fetchLiveTaifexData() {
     const nowHour = new Date().getHours();
     let mType = TAIFEX_MARKET_TYPE;
     if (mType === "AUTO") {
-      mType = (nowHour >= 15 || nowHour < 6) ? "1" : "0";
+      // Night session 15:00~05:00; between 05:00~08:45 show the just-closed night session, 08:45~15:00 day session
+      const nowD = new Date();
+      const hm = nowD.getHours() * 100 + nowD.getMinutes();
+      mType = (hm >= 1500 || hm < 845) ? "1" : "0";
     }
 
     // Fetch Day Session TXF (for Spot TXF-S and Day references) & Night Session TXF if mType == "1"
@@ -385,11 +389,17 @@ async function fetchLiveTaifexData() {
 
     // Build Live Strike Chain & Net Call/Put Option Force
     TAIFEX_STATUS.optionCount = activeOptList.length;
+    // Reset momentum snapshots when contract / session changes so slopes are never computed across different contracts
+    const snapKey = `${TAIFEX_EXPIRE_MONTH}|${mType}`;
+    if (LIVE_CHIP_SNAPSHOTS.length && LIVE_CHIP_SNAPSHOTS[LIVE_CHIP_SNAPSHOTS.length - 1].key !== snapKey) {
+      LIVE_CHIP_SNAPSHOTS.length = 0;
+    }
     const BuiltChain = buildLiveStrikeChainFromTaifex(activeOptList, dayOiMap, txfPrice, TAIFEX_EXPIRE_MONTH);
     ACTIVE_CHAIN = BuiltChain;
 
     // Record real live cross-sectional chip snapshot for true delta verification
     LIVE_CHIP_SNAPSHOTS.push({
+      key: snapKey,
       epoch: nowMs,
       cpDiff: BuiltChain.totalCallNetForce - BuiltChain.totalPutNetForce,
       callNet: BuiltChain.totalCallNetForce,
@@ -502,10 +512,8 @@ function buildLiveStrikeChainFromTaifex(optList, dayOiMap, spotPrice, contractNa
         if (rawLast > prevItem.lastP || (prevItem.askP > 0 && rawLast >= prevItem.askP)) tickSign = 1;
         else if (rawLast < prevItem.lastP || (prevItem.bidP > 0 && rawLast <= prevItem.bidP)) tickSign = -1;
         else tickSign = chg >= 0 ? 1 : -1;
-      } else {
-        deltaVol = prevItem.deltaVol || 0;
-        tickSign = prevItem.tickSign || 0;
       }
+      // No new trades in this poll => no fresh flow (do NOT carry stale ΔVol forward forever)
     }
 
     if (contractName && lastP > 0) {
@@ -606,8 +614,8 @@ function buildLiveStrikeChainFromTaifex(optList, dayOiMap, spotPrice, contractNa
 
     const cDeltaV = s.callDeltaVol || 0;
     const pDeltaV = s.putDeltaVol || 0;
-    const cSign = s.callTickSign || (s.callChg >= 0 ? 1 : -1);
-    const pSign = s.putTickSign || (s.putChg >= 0 ? 1 : -1);
+    const cSign = s.callTickSign || 0;
+    const pSign = s.putTickSign || 0;
     recentCallFlow += cDeltaV * cSign;
     recentPutFlow += pDeltaV * pSign;
     if (cSign > 0) recentAggressiveCallBuy += cDeltaV;
@@ -1384,6 +1392,23 @@ function drawOiWallChart(canvasId, chain) {
 function computeCallPutDecisionMatrix(lastBar, chain) {
   if (!lastBar || !chain) return LIVE_DECISION_METRICS;
   const m = LIVE_DECISION_METRICS;
+  // Historical / replay sessions: rebuild volume totals from the active chain (avoid stale live-session numbers)
+  if (CURRENT_SESSION_ID !== "LIVE_TAIFEX" && Array.isArray(chain.strikes)) {
+    const z = { callTotalVol: 0, putTotalVol: 0, callUpVol: 0, callDnVol: 0, putUpVol: 0, putDnVol: 0,
+      callBidDepthNear: 0, callAskDepthNear: 0, putBidDepthNear: 0, putAskDepthNear: 0 };
+    chain.strikes.forEach(s => {
+      const cv = s.callVol || 0, pv = s.putVol || 0;
+      z.callTotalVol += cv; z.putTotalVol += pv;
+      if ((s.callChg || 0) > 0) z.callUpVol += cv; else if ((s.callChg || 0) < 0) z.callDnVol += cv;
+      if ((s.putChg || 0) > 0) z.putUpVol += pv; else if ((s.putChg || 0) < 0) z.putDnVol += pv;
+      if (Math.abs(s.strike - chain.atmStrike) <= 800) {
+        z.callBidDepthNear += s.callBid || 0; z.callAskDepthNear += s.callAsk || 0;
+        z.putBidDepthNear += s.putBid || 0; z.putAskDepthNear += s.putAsk || 0;
+      }
+    });
+    Object.assign(m, z, { recentCallFlow: 0, recentPutFlow: 0, recentAggressiveCallBuy: 0, recentAggressivePutBuy: 0,
+      volPutCallRatio: Math.round((z.putTotalVol / Math.max(1, z.callTotalVol)) * 1000) / 10 });
+  }
   const price = lastBar.close;
   const vwap = lastBar.greenMidCost;
   const prevBar = ACTIVE_BARS[Math.max(0, ACTIVE_BARS.length - 4)] || lastBar;
@@ -1768,6 +1793,7 @@ function renderStrikesTab() {
 async function openStrikeModal(strikeIdx) {
   const s = ACTIVE_CHAIN.strikes[strikeIdx];
   if (!s) return;
+  const reqToken = ++STRIKE_MODAL_TOKEN;
   const modal = document.getElementById("strikeModal");
   const body = document.getElementById("strikeModalContent");
 
@@ -1821,6 +1847,8 @@ async function openStrikeModal(strikeIdx) {
       const pTicks = (pResp && pResp.RtData && pResp.RtData.Ticks) || [];
       const cQuote = (cResp && cResp.RtData && cResp.RtData.Quote) || {};
       const pQuote = (pResp && pResp.RtData && pResp.RtData.Quote) || {};
+      // Ignore stale responses if user already opened another strike or closed the modal
+      if (reqToken !== STRIKE_MODAL_TOKEN || modal.style.display === "none") return;
 
       const loadEl = document.getElementById("strikeLiveLoading");
       if (loadEl) {
@@ -2618,8 +2646,12 @@ function setSimInitialCapital(newCapInput, shouldResetAll = false) {
   } else {
     const oldCap = SIM_STATE.initialCapital || 500000;
     const diff = n - oldCap;
+    if (SIM_STATE.cash + diff < 0) {
+      alert(`可用餘額不足以調降本金！目前可用 NT$ ${fmtNum(SIM_STATE.cash)}，最多只能調降 NT$ ${fmtNum(SIM_STATE.cash)}。請先平倉或改用「套用並重置帳戶」。`);
+      return;
+    }
     SIM_STATE.initialCapital = n;
-    SIM_STATE.cash = Math.max(0, SIM_STATE.cash + diff);
+    SIM_STATE.cash = SIM_STATE.cash + diff;
     saveSimState();
     SIM_LAST_AUTO_MSG = `💰 已將模擬起始金額調整為 NT$ ${fmtNum(n)}（可用餘額同步${diff >= 0 ? '增加' : '減少'} NT$ ${fmtNum(Math.abs(diff))}）。`;
   }

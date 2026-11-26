@@ -6,6 +6,7 @@ OP 籌碼贏家 Pro — 本地即時行情伺服器 (內建臺灣期貨交易所
 """
 import os
 import sys
+import json
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from urllib.request import Request, urlopen
 
@@ -37,7 +38,7 @@ class TaifexProxyHandler(SimpleHTTPRequestHandler):
                 self.send_response(502)
                 self.send_header("Content-Type", "application/json;charset=UTF-8")
                 self.end_headers()
-                self.wfile.write(('{"error":"' + str(e) + '"}').encode("utf-8"))
+                self.wfile.write(json.dumps({"error": str(e)}, ensure_ascii=False).encode("utf-8"))
             return
         self.send_response(404)
         self.end_headers()
