@@ -518,7 +518,8 @@ function buildLiveStrikeChainFromTaifex(optList, dayOiMap, spotPrice, contractNa
 
     if (contractName && lastP > 0) {
       CONTRACT_PRICE_CACHE[contractName][`${k}_${o.CP}`] = {
-        price: lastP, execBuyP, execSellP, symbol: o.SymbolID || "", bidP, askP, vol, openP, highP, lowP
+        price: lastP, execBuyP, execSellP, symbol: o.SymbolID || "", bidP, askP, vol, openP, highP, lowP,
+        epoch: Date.now()
       };
     }
 
@@ -2253,7 +2254,13 @@ function buildWeeklyAllocationRecommendations() {
       : `${alignCount === 2 ? "三線共振" : (alignCount === 1 ? "雙指標共振" : "籌碼分歧")}(${momentumAligned && priceSlopeAligned ? "價量同向加速" : (priceSlopeAligned ? "價格順勢" : "短線逆勢反彈")})`);
 
   const now = new Date();
-  const isWedSettleDay = now.getDay() === 3 && now.getHours() >= 8 && now.getHours() < 14;
+  // Settlement-day detection based on the ACTUAL target contract's expiry date (W=nth Wed, F=nth Fri, monthly=3rd Wed),
+  // instead of "any Wednesday" (which wrongly penalised next-week contracts and missed Friday weeklies)
+  const expiryDate = getContractExpiryDate(chain.contract || TAIFEX_EXPIRE_MONTH);
+  const isExpiryToday = expiryDate
+    ? (expiryDate.getFullYear() === now.getFullYear() && expiryDate.getMonth() === now.getMonth() && expiryDate.getDate() === now.getDate())
+    : now.getDay() === 3;
+  const isWedSettleDay = isExpiryToday && now.getHours() >= 8 && now.getHours() < 14;
   const isWedAfternoon = isWedSettleDay && now.getHours() >= 11;
 
   // Compute percentile volume reference across near-ATM strikes so score adapts smoothly to early/mid/late session
@@ -2470,7 +2477,10 @@ function buildWeeklyAllocationRecommendations() {
     const allocNtd = Math.round(deployBudget * (pct / 100));
     const isBuy = p.action === "BC" || p.action === "BP";
     const costPerLot = isBuy ? Math.max(500, Math.round(p.price * 50)) : 35000;
-    const suggestedLots = Math.max(1, Math.min(5, Math.floor(allocNtd / costPerLot) || 1));
+    // Do NOT force 1 lot when a single lot exceeds this leg's allocation (old logic silently over-spent the budget);
+    // allow 1 lot only if it still fits within the total deploy budget, otherwise 0 (filtered out below)
+    const rawLots = Math.floor(allocNtd / costPerLot);
+    const suggestedLots = rawLots >= 1 ? Math.min(5, rawLots) : (costPerLot <= deployBudget ? 1 : 0);
     const tpPrice = isBuy
       ? Math.round(p.price * (1 + tpPct / 100) * 10) / 10
       : Math.max(0.5, Math.round(p.price * (1 - tpPct / 100) * 10) / 10);
@@ -2488,7 +2498,20 @@ function buildWeeklyAllocationRecommendations() {
       tpPct,
       slPct
     };
-  });
+  }).filter(r => r.suggestedLots >= 1);
+}
+
+function getContractExpiryDate(code) {
+  const m = /^(\d{4})(\d{2})(?:([WF])(\d))?/.exec(String(code || ""));
+  if (!m) return null;
+  const y = Number(m[1]), mo = Number(m[2]) - 1;
+  const kind = m[3] || "M";
+  const nth = m[4] ? Number(m[4]) : 3;
+  const targetDow = kind === "F" ? 5 : 3;
+  const first = new Date(y, mo, 1);
+  const day = 1 + ((targetDow - first.getDay() + 7) % 7) + (nth - 1) * 7;
+  const d = new Date(y, mo, day);
+  return d.getMonth() === mo ? d : null;
 }
 
 function executeAutoRecommendedPortfolio() {
@@ -2541,7 +2564,7 @@ function checkSimAutoTpSl() {
   const toClose = [];
   let peakUpdated = false;
   SIM_STATE.positions.forEach(pos => {
-    const { pnlNtd, hasLiveQuote } = calcPosUnrealized(pos);
+    const { pnlNtd, midPnlNtd, hasLiveQuote } = calcPosUnrealized(pos);
     if (!hasLiveQuote) return;
     const isBuyer = pos.action === "BC" || pos.action === "BP";
     const baseCapital = isBuyer ? Math.max(500, Math.round(pos.entryPrice * 50 * pos.lots)) : Math.max(35000, pos.marginLocked || 35000);
@@ -2563,8 +2586,11 @@ function checkSimAutoTpSl() {
       }
     }
     // Always enforce hard stop-loss (2-tick confirmed) even if position previously hit trailingArmPct and gapped below 0
+    // Stop-loss is judged on MID price (not Bid): buying at Ask and marking at Bid creates an instant -spread% loss
+    // which, on cheap OTM weeklies (5~10% spread), caused many premature stop-outs with no real adverse move.
+    const midRoiPct = (midPnlNtd / baseCapital) * 100;
     if (!closed) {
-      if (roiPct <= -SIM_AUTO_CONFIG.slPct) {
+      if (midRoiPct <= -SIM_AUTO_CONFIG.slPct) {
         pos.slConfirmCount = (pos.slConfirmCount || 0) + 1;
         if (pos.slConfirmCount >= 2) {
           toClose.push({ id: pos.id, tag: `🛡️ 自動停損 (${roiPct.toFixed(1)}%)` });
@@ -2717,10 +2743,16 @@ function calcPosUnrealized(pos) {
   const liveP = getLiveOptionPrice(pos.strike, pos.cp, pos.contract, exitSide);
   const curP = liveP > 0 ? liveP : pos.entryPrice;
   const diffPts = isBuyer ? (curP - pos.entryPrice) : (pos.entryPrice - curP);
+  // Quote freshness: cached quotes of a contract no longer being polled (user switched contract) must NOT drive auto TP/SL
+  const item = CONTRACT_PRICE_CACHE[pos.contract] && CONTRACT_PRICE_CACHE[pos.contract][`${pos.strike}_${pos.cp}`];
+  const isFresh = !item || !item.epoch || (Date.now() - item.epoch) <= 30000;
+  const midP = (item && item.bidP > 0 && item.askP > 0 && item.askP >= item.bidP) ? (item.bidP + item.askP) / 2 : curP;
+  const midDiff = isBuyer ? (midP - pos.entryPrice) : (pos.entryPrice - midP);
   return {
     curPrice: curP,
-    hasLiveQuote: liveP > 0,
-    pnlNtd: Math.round(diffPts * 50 * pos.lots)
+    hasLiveQuote: liveP > 0 && isFresh,
+    pnlNtd: Math.round(diffPts * 50 * pos.lots),
+    midPnlNtd: Math.round(midDiff * 50 * pos.lots)
   };
 }
 
