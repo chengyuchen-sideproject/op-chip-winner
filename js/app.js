@@ -2140,6 +2140,304 @@ function drawKlineWithCostCanvas(canvasId, bars, maxIdx) {
 // Tab 3.5: 特定週選擇權模擬操作系統 (Paper Trading + Settlement Simulator)
 // ============================================================================
 const SIM_STORAGE_KEY = "op_chip_winner_sim_v1";
+// ---------------------------------------------------------------------------
+// Strategy Signal Log: records the factor snapshot at entry + outcome at exit,
+// so factor weights can be tuned from REAL results instead of guesswork.
+// Stored separately from SIM_STATE (survives account reset; capped at 2000 trades).
+// ---------------------------------------------------------------------------
+const SIGNAL_LOG_KEY = "op_chip_winner_signal_log_v1";
+let SIGNAL_LOG = loadSignalLog();
+let LAST_REC_LIST = [];
+let SIGNAL_CSV_TEXT = "";
+let SIGNAL_PANEL_OPEN = false;
+
+function loadSignalLog() {
+  try {
+    const r = JSON.parse(localStorage.getItem(SIGNAL_LOG_KEY) || "[]");
+    return Array.isArray(r) ? r : [];
+  } catch (e) { return []; }
+}
+
+function saveSignalLog() {
+  try {
+    if (SIGNAL_LOG.length > 2000) SIGNAL_LOG.length = 2000;
+    localStorage.setItem(SIGNAL_LOG_KEY, JSON.stringify(SIGNAL_LOG));
+  } catch (e) {}
+}
+
+function buildEntrySignal(rec, source) {
+  if (!rec) return { source, role: "手動下單", confidence: null };
+  return { source, role: rec.role || "", confidence: rec.confidence ?? rec.winScore ?? null, ...(rec.signal || {}) };
+}
+
+function captureMarketContext() {
+  const lastBar = ACTIVE_BARS[ACTIVE_BARS.length - 1];
+  const chain = ACTIVE_CHAIN;
+  if (!lastBar || !chain) return {};
+  const prev = ACTIVE_BARS[Math.max(0, ACTIVE_BARS.length - 4)] || lastBar;
+  const m = LIVE_DECISION_METRICS;
+  const now = new Date();
+  return {
+    time: now.toTimeString().slice(0, 8),
+    weekday: now.getDay(),
+    session: (TAIFEX_STATUS && TAIFEX_STATUS.activeMarketType) || "",
+    txf: lastBar.close,
+    vwapDiff: Math.round(lastBar.close - lastBar.greenMidCost),
+    slope3: Math.round(lastBar.close - prev.close),
+    cpDiff: lastBar.cpDiffVal,
+    bullScore: m.bullScore,
+    pcRatio: chain.calcPcRatio,
+    atm: chain.atmStrike
+  };
+}
+
+function classifyExitType(tag) {
+  const t = String(tag || "");
+  if (t.includes("移動停利")) return "移動停利";
+  if (t.includes("停利")) return "停利";
+  if (t.includes("停損")) return "停損";
+  if (t.includes("修改")) return "手動修改";
+  return "手動平倉";
+}
+
+function logSignalOutcome(pos, exitPrice, pnlNtd, reasonTag) {
+  const isBuyer = pos.action === "BC" || pos.action === "BP";
+  const base = isBuyer ? Math.max(1, pos.entryPrice * 50 * pos.lots) : Math.max(35000, pos.marginLocked || 35000);
+  const now = new Date();
+  SIGNAL_LOG.unshift({
+    id: pos.id,
+    closeTs: now.getTime(),
+    closeDate: `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`,
+    closeTime: now.toTimeString().slice(0, 8),
+    contract: pos.contract,
+    strike: pos.strike,
+    action: pos.action,
+    lots: pos.lots,
+    entryPrice: pos.entryPrice,
+    exitPrice,
+    pnlNtd,
+    roiPct: Math.round((pnlNtd / base) * 1000) / 10,
+    peakRoiPct: typeof pos.peakRoiPct === "number" ? pos.peakRoiPct : null,
+    holdMin: pos.openEpoch ? Math.round((now.getTime() - pos.openEpoch) / 6000) / 10 : null,
+    addCount: pos.addCount || 0,
+    exitType: classifyExitType(reasonTag),
+    signal: pos.entrySignal || { source: "UNKNOWN" }
+  });
+  saveSignalLog();
+}
+
+function groupSignalStats(list, keyFn, order) {
+  const map = new Map();
+  list.forEach(x => {
+    const k = keyFn(x);
+    if (k === null || k === undefined) return;
+    if (!map.has(k)) map.set(k, { key: k, n: 0, wins: 0, roiSum: 0, pnl: 0 });
+    const g = map.get(k);
+    g.n++;
+    if (x.pnlNtd > 0) g.wins++;
+    g.roiSum += x.roiPct || 0;
+    g.pnl += x.pnlNtd || 0;
+  });
+  const rows = [...map.values()].map(g => ({
+    ...g,
+    winRate: Math.round((g.wins / g.n) * 1000) / 10,
+    avgRoi: Math.round((g.roiSum / g.n) * 10) / 10
+  }));
+  if (order) rows.sort((a, b) => order.indexOf(a.key) - order.indexOf(b.key));
+  else rows.sort((a, b) => b.n - a.n);
+  return rows;
+}
+
+function signalDimensions() {
+  const shortRole = r => {
+    const s = String(r || "");
+    if (s.includes("核心")) return "核心順勢";
+    if (s.includes("槓桿")) return "價外槓桿";
+    if (s.includes("避險")) return "反向避險";
+    return "手動";
+  };
+  return [
+    { title: "下單來源", fn: x => ({ AUTO: "一鍵自動", REC_MANUAL: "推薦單筆", MANUAL: "手動自選" }[x.signal.source] || "未知") },
+    { title: "推薦角色", fn: x => shortRole(x.signal.role) },
+    { title: "信心度區間", order: ["<80", "80~84", "85~89", "≥90", "無"], fn: x => {
+      const c = x.signal.confidence;
+      if (c === null || c === undefined) return "無";
+      return c >= 90 ? "≥90" : (c >= 85 ? "85~89" : (c >= 80 ? "80~84" : "<80"));
+    } },
+    { title: "多空風向強度", order: ["震盪 <58%", "偏向 58~69%", "強烈 ≥70%"], fn: x => {
+      const b = x.signal.ctx && x.signal.ctx.bullScore;
+      if (typeof b !== "number") return null;
+      const conv = Math.max(b, 100 - b);
+      return conv >= 70 ? "強烈 ≥70%" : (conv >= 58 ? "偏向 58~69%" : "震盪 <58%");
+    } },
+    { title: "盤勢狀態", fn: x => {
+      const s = x.signal;
+      if (s.alignCount === undefined) return null;
+      if (s.isDoubleSell) return "雙賣盤整";
+      if (s.isWeakChop) return "方向未明";
+      return s.alignCount === 2 ? "三線共振" : (s.alignCount === 1 ? "雙指標共振" : "籌碼分歧");
+    } },
+    { title: "價格順勢", fn: x => x.signal.priceSlopeAligned === undefined ? null : (x.signal.priceSlopeAligned ? "順勢進場" : "逆勢進場") },
+    { title: "突破成本線", fn: x => x.signal.costBreakout === undefined ? null : (x.signal.costBreakout ? "已突破" : "未突破") },
+    { title: "買賣價差", order: ["≤3%", "3~5%", "5~8%", ">8%"], fn: x => {
+      const p = x.signal.spreadPct;
+      if (typeof p !== "number") return null;
+      return p <= 3 ? "≤3%" : (p <= 5 ? "3~5%" : (p <= 8 ? "5~8%" : ">8%"));
+    } },
+    { title: "進場權利金", order: ["<30", "30~99", "100~299", "≥300"], fn: x => {
+      const p = x.entryPrice;
+      return p < 30 ? "<30" : (p < 100 ? "30~99" : (p < 300 ? "100~299" : "≥300"));
+    } },
+    { title: "盤別", fn: x => {
+      const s = x.signal.ctx && x.signal.ctx.session;
+      return s === "1" ? "夜盤" : (s === "0" ? "日盤" : null);
+    } },
+    { title: "出場方式", order: ["停利", "移動停利", "停損", "手動平倉", "手動修改"], fn: x => x.exitType },
+    { title: "持有時間", order: ["<5分", "5~30分", "30~120分", ">120分"], fn: x => {
+      const h = x.holdMin;
+      if (typeof h !== "number") return null;
+      return h < 5 ? "<5分" : (h < 30 ? "5~30分" : (h < 120 ? "30~120分" : ">120分"));
+    } }
+  ];
+}
+
+function buildSignalCsv() {
+  const cols = [
+    ["closeDate", x => x.closeDate], ["closeTime", x => x.closeTime], ["contract", x => x.contract],
+    ["strike", x => x.strike], ["action", x => x.action], ["lots", x => x.lots],
+    ["entryPrice", x => x.entryPrice], ["exitPrice", x => x.exitPrice], ["pnlNtd", x => x.pnlNtd],
+    ["roiPct", x => x.roiPct], ["peakRoiPct", x => x.peakRoiPct], ["holdMin", x => x.holdMin],
+    ["exitType", x => x.exitType], ["source", x => x.signal.source], ["role", x => x.signal.role],
+    ["confidence", x => x.signal.confidence], ["sVol", x => x.signal.vol], ["sOrderBook", x => x.signal.ob],
+    ["sSpread", x => x.signal.spread], ["sStruct", x => x.signal.struct], ["sTrend", x => x.signal.trend],
+    ["alignCount", x => x.signal.alignCount], ["isWeakChop", x => x.signal.isWeakChop], ["isDoubleSell", x => x.signal.isDoubleSell],
+    ["momentumAligned", x => x.signal.momentumAligned], ["priceSlopeAligned", x => x.signal.priceSlopeAligned],
+    ["costBreakout", x => x.signal.costBreakout], ["isExpiryDay", x => x.signal.isExpiryDay], ["spreadPct", x => x.signal.spreadPct],
+    ["distFromAtm", x => x.signal.dist], ["bullScore", x => x.signal.ctx && x.signal.ctx.bullScore],
+    ["vwapDiff", x => x.signal.ctx && x.signal.ctx.vwapDiff], ["slope3", x => x.signal.ctx && x.signal.ctx.slope3],
+    ["cpDiff", x => x.signal.ctx && x.signal.ctx.cpDiff], ["pcRatio", x => x.signal.ctx && x.signal.ctx.pcRatio],
+    ["session", x => x.signal.ctx && x.signal.ctx.session], ["entryTime", x => x.signal.ctx && x.signal.ctx.time]
+  ];
+  const esc = v => {
+    if (v === null || v === undefined) return "";
+    const s = String(v);
+    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const lines = [cols.map(c => c[0]).join(",")];
+  SIGNAL_LOG.slice().reverse().forEach(x => lines.push(cols.map(c => esc(c[1](x))).join(",")));
+  return lines.join("\n");
+}
+
+function exportSignalLogCsv() {
+  if (!SIGNAL_LOG.length) { alert("目前尚無策略訊號紀錄可匯出。"); return; }
+  const csv = buildSignalCsv();
+  const isAndroidApp = typeof window.TaifexNative !== "undefined";
+  if (!isAndroidApp) {
+    const blob = new Blob(["\ufeff" + csv], { type: "text/csv;charset=utf-8" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `op_signal_log_${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  } else {
+    // Android WebView cannot download Blob files: show selectable text (and try clipboard)
+    SIGNAL_CSV_TEXT = csv;
+    try { if (navigator.clipboard) navigator.clipboard.writeText(csv).catch(() => {}); } catch (e) {}
+    SIGNAL_PANEL_OPEN = true;
+    renderSimTab();
+  }
+}
+
+function clearSignalLog() {
+  if (!confirm(`確定要清除全部 ${SIGNAL_LOG.length} 筆策略訊號紀錄嗎？（此動作無法復原，建議先匯出 CSV）`)) return;
+  SIGNAL_LOG = [];
+  SIGNAL_CSV_TEXT = "";
+  saveSignalLog();
+  renderSimTab();
+}
+
+function buildSignalAnalyticsHtml() {
+  const list = SIGNAL_LOG;
+  const n = list.length;
+  const header = `
+    <div class="panel-header" style="cursor:pointer" onclick="SIGNAL_PANEL_OPEN=!SIGNAL_PANEL_OPEN;renderSimTab()">
+      <div>
+        <h2 class="section-h2">📊 策略訊號績效分析 ${SIGNAL_PANEL_OPEN ? '▴' : '▾'}</h2>
+        <div style="font-size:0.76rem;color:var(--muted);margin-top:3px">記錄每筆進場時的各項評分因子與出場結果，用真實數據找出哪些條件真正有效（已累積 <strong style="color:#fde047">${n}</strong> 筆）</div>
+      </div>
+      <div class="btn-group" onclick="event.stopPropagation()">
+        <button class="btn" style="padding:4px 10px;font-size:0.74rem" onclick="exportSignalLogCsv()">📥 匯出 CSV</button>
+        <button class="btn" style="padding:4px 10px;font-size:0.74rem" onclick="clearSignalLog()">🗑️ 清除</button>
+      </div>
+    </div>`;
+  if (!SIGNAL_PANEL_OPEN) return `<div class="panel-card">${header}</div>`;
+  if (!n) {
+    return `<div class="panel-card">${header}
+      <div style="text-align:center;padding:18px;color:var(--muted);font-size:0.84rem">尚無紀錄。從現在起每筆模擬平倉都會自動記錄進場訊號與結果。</div></div>`;
+  }
+  const wins = list.filter(x => x.pnlNtd > 0);
+  const losses = list.filter(x => x.pnlNtd <= 0);
+  const avg = arr => arr.length ? Math.round((arr.reduce((a, x) => a + (x.roiPct || 0), 0) / arr.length) * 10) / 10 : 0;
+  const grossWin = wins.reduce((a, x) => a + x.pnlNtd, 0);
+  const grossLoss = Math.abs(losses.reduce((a, x) => a + x.pnlNtd, 0));
+  const pf = grossLoss > 0 ? (grossWin / grossLoss).toFixed(2) : (grossWin > 0 ? "∞" : "-");
+  const totalPnl = list.reduce((a, x) => a + (x.pnlNtd || 0), 0);
+  const winRate = Math.round((wins.length / n) * 1000) / 10;
+  const avgWin = avg(wins), avgLoss = avg(losses);
+  const breakEvenWr = (avgWin - avgLoss) !== 0 ? Math.round((Math.abs(avgLoss) / (avgWin + Math.abs(avgLoss))) * 1000) / 10 : null;
+  const sampleWarn = n < 30
+    ? `<div style="margin:8px 0;padding:6px 10px;border-radius:6px;background:rgba(245,158,11,0.14);border:1px solid rgba(245,158,11,0.4);color:#fbbf24;font-size:0.75rem">⚠️ 樣本僅 ${n} 筆，統計結果誤差很大，建議累積 30 筆以上（各分組 10 筆以上）再據此調整參數。</div>`
+    : "";
+  const kpi = (label, val, color) => `<div style="background:#090e1a;border:1px solid var(--border);border-radius:8px;padding:8px 10px"><div style="font-size:0.7rem;color:var(--muted)">${label}</div><div style="font-size:1rem;font-weight:800;color:${color || '#fff'}">${val}</div></div>`;
+
+  const tables = signalDimensions().map(dim => {
+    const rows = groupSignalStats(list, dim.fn, dim.order);
+    if (!rows.length) return "";
+    return `
+      <div style="background:#090e1a;border:1px solid rgba(148,163,184,0.18);border-radius:8px;padding:8px 10px">
+        <div style="font-size:0.78rem;font-weight:800;color:#38bdf8;margin-bottom:4px">${escapeHtml(dim.title)}</div>
+        <table style="width:100%;font-size:0.73rem;border-collapse:collapse">
+          <thead><tr style="color:var(--muted)"><th style="text-align:left;font-weight:600">分組</th><th style="text-align:right;font-weight:600">筆數</th><th style="text-align:right;font-weight:600">勝率</th><th style="text-align:right;font-weight:600">平均ROI</th><th style="text-align:right;font-weight:600">損益</th></tr></thead>
+          <tbody>
+            ${rows.map(r => `
+              <tr style="border-top:1px solid rgba(148,163,184,0.12)">
+                <td style="text-align:left;color:#e2e8f0;padding:2px 0">${escapeHtml(String(r.key))}</td>
+                <td style="text-align:right;color:${r.n < 10 ? '#94a3b8' : '#e2e8f0'}">${r.n}</td>
+                <td style="text-align:right;font-weight:700;color:${r.winRate >= 50 ? '#f87171' : '#4ade80'}">${r.winRate}%</td>
+                <td style="text-align:right;color:${r.avgRoi >= 0 ? '#f87171' : '#4ade80'}">${r.avgRoi >= 0 ? '+' : ''}${r.avgRoi}%</td>
+                <td style="text-align:right;color:${r.pnl >= 0 ? '#f87171' : '#4ade80'}">${r.pnl >= 0 ? '+' : ''}${fmtNum(r.pnl)}</td>
+              </tr>`).join("")}
+          </tbody>
+        </table>
+      </div>`;
+  }).join("");
+
+  return `
+    <div class="panel-card">
+      ${header}
+      ${sampleWarn}
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;margin-bottom:10px">
+        ${kpi("總筆數", n)}
+        ${kpi("勝率", `${winRate}%`, winRate >= 50 ? '#f87171' : '#4ade80')}
+        ${kpi("損益兩平所需勝率", breakEvenWr !== null ? `${breakEvenWr}%` : "-", '#fde047')}
+        ${kpi("平均獲利 / 虧損 ROI", `+${avgWin}% / ${avgLoss}%`)}
+        ${kpi("獲利因子 (PF)", pf, Number(pf) >= 1 ? '#f87171' : '#4ade80')}
+        ${kpi("累計損益", `${totalPnl >= 0 ? '+' : ''}NT$ ${fmtNum(totalPnl)}`, totalPnl >= 0 ? '#f87171' : '#4ade80')}
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:8px">
+        ${tables}
+      </div>
+      ${SIGNAL_CSV_TEXT ? `
+        <div style="margin-top:10px">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+            <span style="font-size:0.75rem;color:#cbd5e1">📋 CSV 內容（已嘗試複製到剪貼簿；若未成功請長按全選複製）：</span>
+            <button class="btn" style="padding:2px 8px;font-size:0.7rem" onclick="SIGNAL_CSV_TEXT='';renderSimTab()">✕ 關閉</button>
+          </div>
+          <textarea readonly style="width:100%;height:140px;background:#0f172a;color:#e2e8f0;border:1px solid var(--border);border-radius:6px;font-size:0.68rem;font-family:Consolas,monospace" onfocus="this.select()">${escapeHtml(SIGNAL_CSV_TEXT)}</textarea>
+        </div>` : ''}
+    </div>`;
+}
 let SIM_STATE = loadSimState();
 let SIM_FORM = { action: "BC", strike: 0, lots: 1, whatIfSettle: 0 };
 let SIM_AUTO_CONFIG = {
@@ -2199,6 +2497,15 @@ function updateSimHistoryExitPrice(histId) {
   h.exitPrice = Math.round(newExit * 100) / 100;
   h.pnlNtd = newPnl;
   h.reasonTag = "手動修改賣價";
+  const logItem = SIGNAL_LOG.find(x => x.id === h.id && x.entryPrice === h.entryPrice);
+  if (logItem) {
+    const base = isBuyer ? Math.max(1, h.entryPrice * 50 * h.lots) : 35000 * h.lots;
+    logItem.exitPrice = h.exitPrice;
+    logItem.pnlNtd = newPnl;
+    logItem.roiPct = Math.round((newPnl / base) * 1000) / 10;
+    logItem.exitType = "手動修改";
+    saveSignalLog();
+  }
   saveSimState();
   renderSimTab();
 }
@@ -2347,10 +2654,28 @@ function buildWeeklyAllocationRecommendations() {
     const rawScore = baseScore + volScore + bidAskBonus + spreadBonus + wallBonus + valueEfficiencyBonus + thetaBonus + dirBonus;
     const finalScore = Math.max(0, Math.min(96, Math.round(rawScore)));
     const breakdown = `基準${baseScore} + 量能${volScore} + 掛單動能${bidAskBonus} + 價差${spreadBonus >= 0 ? '+' + spreadBonus : spreadBonus} + 結構${wallBonus + valueEfficiencyBonus + thetaBonus >= 0 ? '+' + (wallBonus + valueEfficiencyBonus + thetaBonus) : (wallBonus + valueEfficiencyBonus + thetaBonus)} + 趨勢${dirBonus >= 0 ? '+' + dirBonus : dirBonus} = ${finalScore}%`;
+    const spreadPctVal = (bidP > 0 && askP > 0 && price > 0) ? Math.round(((askP - bidP) / price) * 1000) / 10 : null;
     return {
       score: finalScore,
       breakdown,
-      metaTag: [alignLabel, spreadTag, thetaTag].filter(Boolean).join("・")
+      metaTag: [alignLabel, spreadTag, thetaTag].filter(Boolean).join("・"),
+      // Entry-signal snapshot for post-trade analytics (which factors actually predict wins)
+      signal: {
+        vol: volScore,
+        ob: bidAskBonus,
+        spread: spreadBonus,
+        struct: wallBonus + valueEfficiencyBonus + thetaBonus,
+        trend: dirBonus,
+        alignCount,
+        isWeakChop,
+        isDoubleSell: isDoubleSellRange,
+        momentumAligned,
+        priceSlopeAligned,
+        costBreakout: costBandBreakout,
+        isExpiryDay: isWedSettleDay,
+        isHedge: !!isHedge,
+        spreadPct: spreadPctVal
+      }
     };
   };
 
@@ -2371,6 +2696,7 @@ function buildWeeklyAllocationRecommendations() {
           strike: s.strike, cp: "P", action: "BP", price: pEntry, vol: s.putVol, oi: s.putOi,
           winScore: sc.score,
           breakdown: sc.breakdown,
+          signal: sc.signal,
           role: "🔥 1. 核心順勢買方 (近價平)",
           reason: `空方主導 (${dist}點)，${sc.metaTag}，成交量 ${fmtNum(s.putVol)} 口`
         });
@@ -2382,6 +2708,7 @@ function buildWeeklyAllocationRecommendations() {
           strike: s.strike, cp: "P", action: "BP", price: pEntry, vol: s.putVol, oi: s.putOi,
           winScore: sc.score,
           breakdown: sc.breakdown,
+          signal: sc.signal,
           role: "⚡ 2. 高槓桿波段買方 (價外)",
           reason: `權利金成本較低 (${dist}點)，${sc.metaTag}，急殺放大快`
         });
@@ -2393,6 +2720,7 @@ function buildWeeklyAllocationRecommendations() {
           strike: s.strike, cp: "C", action: "BC", price: cEntry, vol: s.callVol, oi: s.callOi,
           winScore: sc.score,
           breakdown: sc.breakdown,
+          signal: sc.signal,
           role: "🛡️ 3. 買方反轉保護單 (BC避險)",
           reason: `防軋空反轉 (+${dist}點)，${sc.metaTag}，買方勒式保護`
         });
@@ -2405,6 +2733,7 @@ function buildWeeklyAllocationRecommendations() {
           strike: s.strike, cp: "C", action: "BC", price: cEntry, vol: s.callVol, oi: s.callOi,
           winScore: sc.score,
           breakdown: sc.breakdown,
+          signal: sc.signal,
           role: "🔥 1. 核心順勢買方 (近價平)",
           reason: `多方主導 (+${dist}點)，${sc.metaTag}，成交量 ${fmtNum(s.callVol)} 口`
         });
@@ -2416,6 +2745,7 @@ function buildWeeklyAllocationRecommendations() {
           strike: s.strike, cp: "C", action: "BC", price: cEntry, vol: s.callVol, oi: s.callOi,
           winScore: sc.score,
           breakdown: sc.breakdown,
+          signal: sc.signal,
           role: "⚡ 2. 高槓桿波段買方 (價外)",
           reason: `權利金成本較低 (+${dist}點)，${sc.metaTag}，突破放大快`
         });
@@ -2427,6 +2757,7 @@ function buildWeeklyAllocationRecommendations() {
           strike: s.strike, cp: "P", action: "BP", price: pEntry, vol: s.putVol, oi: s.putOi,
           winScore: sc.score,
           breakdown: sc.breakdown,
+          signal: sc.signal,
           role: "🛡️ 3. 買方反轉保護單 (BP避險)",
           reason: `防急殺回測 (${dist}點)，${sc.metaTag}，買方勒式保護`
         });
@@ -2472,7 +2803,7 @@ function buildWeeklyAllocationRecommendations() {
   const tpPct = SIM_AUTO_CONFIG.tpPct;
   const slPct = SIM_AUTO_CONFIG.slPct;
 
-  return picked.map((p, idx) => {
+  const finalRecs = picked.map((p, idx) => {
     const pct = weightProfiles[idx];
     const allocNtd = Math.round(deployBudget * (pct / 100));
     const isBuy = p.action === "BC" || p.action === "BP";
@@ -2499,6 +2830,8 @@ function buildWeeklyAllocationRecommendations() {
       slPct
     };
   }).filter(r => r.suggestedLots >= 1);
+  LAST_REC_LIST = finalRecs;
+  return finalRecs;
 }
 
 function getContractExpiryDate(code) {
@@ -2542,7 +2875,7 @@ function executeAutoRecommendedPortfolio() {
     const maxAffordableLots = Math.floor(SIM_STATE.cash / costPerLot);
     const execLots = Math.min(r.suggestedLots, maxAffordableLots);
     if (execLots >= 1) {
-      placeSimOrder(r.strike, r.action, execLots, true);
+      placeSimOrder(r.strike, r.action, execLots, true, buildEntrySignal(r, "AUTO"));
       placed++;
       if (!isHedgeRec) mainLegPlacedOrHeld = true;
     } else {
@@ -2756,7 +3089,7 @@ function calcPosUnrealized(pos) {
   };
 }
 
-function placeSimOrder(customStrike = null, customAction = null, customLots = null, silent = false) {
+function placeSimOrder(customStrike = null, customAction = null, customLots = null, silent = false, entrySignal = null) {
   const strike = Number(customStrike || SIM_FORM.strike || (ACTIVE_CHAIN ? ACTIVE_CHAIN.atmStrike : 35000));
   const action = customAction || SIM_FORM.action || "BC";
   const lots = Math.max(1, Number(customLots || SIM_FORM.lots || 1));
@@ -2788,6 +3121,16 @@ function placeSimOrder(customStrike = null, customAction = null, customLots = nu
 
   const symInfo = (CONTRACT_PRICE_CACHE[activeContract] && CONTRACT_PRICE_CACHE[activeContract][`${strike}_${cp}`]) || {};
   const nowTime = new Date().toTimeString().slice(0, 8);
+
+  // Resolve entry-signal snapshot: explicit (auto) > matching current recommendation (single-click) > manual
+  let sig = entrySignal;
+  if (!sig) {
+    const rec = (LAST_REC_LIST || []).find(r => r.strike === strike && r.action === action);
+    sig = rec ? buildEntrySignal(rec, "REC_MANUAL") : buildEntrySignal(null, "MANUAL");
+  }
+  sig.entryPrice = price;
+  sig.dist = ACTIVE_CHAIN ? strike - ACTIVE_CHAIN.atmStrike : null;
+  sig.ctx = captureMarketContext();
   const existingIdx = SIM_STATE.positions.findIndex(
     p => p.contract === activeContract && p.strike === strike && p.action === action
   );
@@ -2807,6 +3150,9 @@ function placeSimOrder(customStrike = null, customAction = null, customLots = nu
     const mergedBaseCap = isBuyer ? Math.max(500, Math.round(existing.entryPrice * 50 * existing.lots)) : Math.max(35000, existing.marginLocked || 35000);
     existing.peakRoiPct = Math.round(((mergedPnl / mergedBaseCap) * 100) * 10) / 10;
     if (!existing.symbol && symInfo.symbol) existing.symbol = symInfo.symbol;
+    if (!existing.entrySignal) existing.entrySignal = sig;
+    if (!existing.openEpoch) existing.openEpoch = Date.now();
+    existing.addCount = (existing.addCount || 0) + 1;
     SIM_STATE.positions.splice(existingIdx, 1);
     SIM_STATE.positions.unshift(existing);
   } else {
@@ -2821,6 +3167,8 @@ function placeSimOrder(customStrike = null, customAction = null, customLots = nu
       entryPrice: price,
       marginLocked: isBuyer ? 0 : (marginPerLot * lots),
       time: nowTime,
+      openEpoch: Date.now(),
+      entrySignal: sig,
       legs: [{ lots, price, time: nowTime }]
     });
   }
@@ -2866,6 +3214,7 @@ function closeSimPosition(posId, reasonTag = "手動平倉", silent = false) {
     legs: Array.isArray(pos.legs) && pos.legs.length ? pos.legs : [{ lots: pos.lots, price: pos.entryPrice, time: pos.time || "" }]
   });
   if (SIM_STATE.history.length > 30) SIM_STATE.history.pop();
+  logSignalOutcome(pos, curPrice, pnlNtd, reasonTag);
 
   SIM_STATE.positions.splice(idx, 1);
   saveSimState();
@@ -3213,6 +3562,8 @@ function renderSimTab() {
         </div>
       `}
     </div>
+
+    ${buildSignalAnalyticsHtml()}
 
     ${SIM_STATE.history.length ? `
       <div class="panel-card">
