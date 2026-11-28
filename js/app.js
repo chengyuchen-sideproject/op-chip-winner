@@ -1417,42 +1417,44 @@ function computeCallPutDecisionMatrix(lastBar, chain) {
   m.txfVsVwapPts = Math.round(vwapDiff);
   m.txfSlope3Bars = Math.round(priceSlope);
 
-  // 1. CP Net Force Score (-20 to +20)
+  // 1. CP Net Force Score (-24 to +24) — primary directional anchor
   const totalVol = Math.max(1, m.callTotalVol + m.putTotalVol);
-  const cpRatio = lastBar.cpDiffVal / totalVol; // -1.0 to +1.0
-  const cpScore = Math.max(-20, Math.min(20, Math.round(cpRatio * 28)));
+  const cpRatio = lastBar.cpDiffVal / totalVol; // scaled by compositeDir (~ -0.6 to +0.6)
+  const cpScore = Math.max(-24, Math.min(24, Math.round(cpRatio * 38)));
 
-  // 2. Real-time Tick Flow & Aggressive Ask-Hit Score (-15 to +15)
+  // 2. Real-time Tick Flow Score (-6 to +6) — secondary confirmation only (prevents 6s noise whipsaw)
   const netRecentFlow = (m.recentCallFlow || 0) - (m.recentPutFlow || 0);
-  const flowScore = netRecentFlow !== 0
-    ? Math.max(-15, Math.min(15, Math.round(Math.sign(netRecentFlow) * Math.min(15, Math.log2(Math.abs(netRecentFlow) + 1) * 2.5))))
+  const absFlow = Math.abs(netRecentFlow);
+  const flowScore = absFlow >= 20
+    ? Math.max(-6, Math.min(6, Math.round(Math.sign(netRecentFlow) * Math.min(6, Math.log2(absFlow / 10 + 1) * 2))))
     : 0;
 
-  // 3. TXF Price vs VWAP & Cost Bands (-15 to +15)
+  // 3. TXF Price vs VWAP (-12 to +12) — with +/-10pt neutral deadband around VWAP to prevent 1pt cliff flips
   let vwapScore = 0;
-  if (price >= lastBar.redBullCost && price >= vwap) vwapScore = 15;
-  else if (price >= vwap) vwapScore = 8;
-  else if (price <= lastBar.blueBearCost && price <= vwap) vwapScore = -15;
-  else vwapScore = -8;
+  if (vwapDiff >= 30) vwapScore = 12;
+  else if (vwapDiff >= 10) vwapScore = 6;
+  else if (vwapDiff <= -30) vwapScore = -12;
+  else if (vwapDiff <= -10) vwapScore = -6;
+  else vwapScore = 0;
 
   // 4. Short-term 3-bar Momentum & Live Snapshot Slope (-10 to +10)
-  let slopeScore = priceSlope > 15 ? 7 : (priceSlope > 0 ? 3 : (priceSlope < -15 ? -7 : (priceSlope < 0 ? -3 : 0)));
+  let slopeScore = priceSlope > 20 ? 7 : (priceSlope > 6 ? 3 : (priceSlope < -20 ? -7 : (priceSlope < -6 ? -3 : 0)));
   if (LIVE_CHIP_SNAPSHOTS.length >= 2) {
     const sFirst = LIVE_CHIP_SNAPSHOTS[Math.max(0, LIVE_CHIP_SNAPSHOTS.length - 4)];
     const sLast = LIVE_CHIP_SNAPSHOTS[LIVE_CHIP_SNAPSHOTS.length - 1];
     const dCp = sLast.cpDiff - sFirst.cpDiff;
-    if (dCp > 50) slopeScore += 3;
-    else if (dCp < -50) slopeScore -= 3;
+    if (dCp > 120) slopeScore += 3;
+    else if (dCp < -120) slopeScore -= 3;
   }
 
-  // 5. Near-ATM Option Order-Book Bid/Ask Imbalance & OI P/C Ratio (-10 to +10)
+  // 5. Near-ATM Option Order-Book Bid/Ask Imbalance & OI P/C Ratio (-8 to +8)
   const cImb = (m.callBidDepthNear - m.callAskDepthNear) / Math.max(1, m.callBidDepthNear + m.callAskDepthNear);
   const pImb = (m.putBidDepthNear - m.putAskDepthNear) / Math.max(1, m.putBidDepthNear + m.putAskDepthNear);
-  const obScore = Math.max(-6, Math.min(6, Math.round((cImb - pImb) * 8)));
+  const obScore = Math.max(-4, Math.min(4, Math.round((cImb - pImb) * 6)));
   const pcScore = chain.calcPcRatio >= 110 ? 4 : (chain.calcPcRatio <= 88 ? -4 : 0);
 
-  const rawNet = cpScore + flowScore + vwapScore + slopeScore + obScore + pcScore; // -70 to +70
-  const bullPct = Math.max(8, Math.min(92, Math.round(50 + rawNet * 0.65)));
+  const rawNet = cpScore + flowScore + vwapScore + slopeScore + obScore + pcScore; // -60 to +60
+  const bullPct = Math.max(8, Math.min(92, Math.round(50 + rawNet * 0.7)));
   const bearPct = 100 - bullPct;
 
   m.bullScore = bullPct;
@@ -2211,8 +2213,10 @@ function buildWeeklyAllocationRecommendations() {
   const pVal = lastBar.putVal;
   // Detect Seller Range-Pin Regime (SC + SP: both Call and Put below zero axis)
   const isDoubleSellRange = cVal < 0 && pVal < 0;
-  // Determine dominant bull/bear direction from multi-factor Call/Put Decision Matrix (CP Force + VWAP + Real-time Flow + OB Imbalance)
-  const isBull = dm.bullScore >= 50;
+  // Determine dominant bull/bear direction: anchor to stable Green Line (CP Diff) unless Decision Matrix has clear >=58% conviction
+  const dmConviction = Math.max(dm.bullScore, dm.bearScore);
+  const isWeakChop = dmConviction < 58;
+  const isBull = dmConviction >= 58 ? (dm.bullScore >= 50) : (lastBar.cpDiffVal >= 0);
   const mainAct = isBull ? "BC" : "BP";
   const singleWingAttack = isBull ? (cVal >= 0 && pVal <= 0) : (pVal >= 0 && cVal <= 0);
   const cpStrengthBonus = Math.min(4, Math.floor(Math.abs(lastBar.cpDiffVal) / 15000)) + (singleWingAttack ? 2 : 0);
@@ -2237,13 +2241,16 @@ function buildWeeklyAllocationRecommendations() {
       momentumAligned = isBull ? (snapDelta > 0) : (snapDelta < 0);
     }
   }
+  const chopPenalty = isDoubleSellRange ? -12 : (isWeakChop ? -8 : 0);
   const momentumBonus = isDoubleSellRange
-    ? -8
-    : ((momentumAligned ? 3 : -4) + (priceSlopeAligned ? 2 : -4) + (costBandBreakout ? 2 : 0));
+    ? chopPenalty
+    : (chopPenalty + (momentumAligned ? 3 : -4) + (priceSlopeAligned ? 2 : -4) + (costBandBreakout ? 2 : 0));
   const trendBonus = (alignCount === 2 ? 7 : (alignCount === 1 ? 2 : -6)) + cpStrengthBonus + momentumBonus;
   const alignLabel = isDoubleSellRange
     ? "雙賣盤整慎追"
-    : `${alignCount === 2 ? "三線共振" : (alignCount === 1 ? "雙指標共振" : "籌碼分歧")}(${momentumAligned && priceSlopeAligned ? "價量同向加速" : (priceSlopeAligned ? "價格順勢" : "短線逆勢反彈")})`;
+    : (isWeakChop
+      ? "方向未明震盪(慎防洗盤)"
+      : `${alignCount === 2 ? "三線共振" : (alignCount === 1 ? "雙指標共振" : "籌碼分歧")}(${momentumAligned && priceSlopeAligned ? "價量同向加速" : (priceSlopeAligned ? "價格順勢" : "短線逆勢反彈")})`);
 
   const now = new Date();
   const isWedSettleDay = now.getDay() === 3 && now.getHours() >= 8 && now.getHours() < 14;
@@ -2265,12 +2272,14 @@ function buildWeeklyAllocationRecommendations() {
     const oiBonus = Math.min(3, Math.round(Math.log10((oi || 0) + 1)));
     const volScore = Math.min(volCap, Math.round(relVolRatio * (volCap - 3)) + oiBonus);
 
-    // 2. Order Book, Intraday Expansion & Real-time Tick Burst (0 ~ 11 pts)
+    // 2. Order Book & Premium Momentum (-3 ~ +8 pts, capped to prevent score inflation & top-tick chasing)
     const imbRatio = (bidSz - askSz) / Math.max(1, bidSz + askSz);
     const imbScore = Math.round((imbRatio + 1) * 2.5); // 0 ~ 5 pts
-    const chgScore = (chg > 0 && intradayChg >= 0) ? 4 : (chg > 0 || intradayChg > 0 ? 2 : (chg === 0 ? 1 : -2));
-    const burstScore = (deltaVol >= 5 && tickSign > 0) ? 2 : ((deltaVol > 0 && tickSign > 0) ? 1 : ((deltaVol >= 5 && tickSign < 0) ? -2 : 0));
-    const bidAskBonus = imbScore + chgScore + burstScore;
+    const chgScore = (chg > 0 && intradayChg >= 0) ? 3 : (chg > 0 || intradayChg > 0 ? 1 : (chg === 0 ? 0 : -2));
+    const burstScore = (deltaVol >= 10 && tickSign > 0) ? 1 : ((deltaVol >= 10 && tickSign < 0) ? -2 : 0);
+    const baseOpenEst = Math.max(10, price - intradayChg);
+    const overextendedPenalty = (!isHedge && intradayChg > 0 && (intradayChg / baseOpenEst) >= 0.35) ? -3 : 0;
+    const bidAskBonus = Math.max(-4, Math.min(8, imbScore + chgScore + burstScore + overextendedPenalty));
 
     // 3. Continuous Bid-Ask Spread Cost Score (-12 ~ +6 pts)
     let spreadBonus = 0;
@@ -2324,9 +2333,8 @@ function buildWeeklyAllocationRecommendations() {
     // 6. Directional Consensus vs Reversal Hedge Need
     let dirBonus = trendBonus;
     if (isHedge) {
-      // Hedge leg is most valuable when main trend is overextended or showing short-term counter-bounce
-      dirBonus = (!priceSlopeAligned || alignCount <= 1) ? 7 : 3;
-      if (isDoubleSellRange) dirBonus = -4;
+      // Hedge leg is only worthwhile when main trend is showing counter-bounce; suppress in strong one-way trend or chop
+      dirBonus = (isDoubleSellRange || isWeakChop) ? -8 : ((!priceSlopeAligned || alignCount <= 1) ? 4 : -2);
     }
 
     const rawScore = baseScore + volScore + bidAskBonus + spreadBonus + wallBonus + valueEfficiencyBonus + thetaBonus + dirBonus;
@@ -2453,7 +2461,7 @@ function buildWeeklyAllocationRecommendations() {
 
   // Assign percentage weights summing to 100% (previous version setting)
   const weightProfiles = picked.length === 3 ? [50, 30, 20] : (picked.length === 2 ? [60, 40] : [100]);
-  const deployBudget = Math.max(20000, Math.round(SIM_STATE.cash * (SIM_AUTO_CONFIG.allocBudgetPct / 100)));
+  const deployBudget = Math.min(SIM_STATE.cash, Math.max(5000, Math.round(SIM_STATE.cash * (SIM_AUTO_CONFIG.allocBudgetPct / 100))));
   const tpPct = SIM_AUTO_CONFIG.tpPct;
   const slPct = SIM_AUTO_CONFIG.slPct;
 
@@ -2492,23 +2500,38 @@ function executeAutoRecommendedPortfolio() {
   const activeContract = (ACTIVE_CHAIN && ACTIVE_CHAIN.contract) || TAIFEX_EXPIRE_MONTH || getSessionConfig().contract || "202611W4";
   let placed = 0;
   let skippedDup = 0;
+  let skippedCash = 0;
+  let mainLegPlacedOrHeld = false;
   recs.forEach(r => {
+    const isHedgeRec = r.role && r.role.includes("避險");
     const alreadyHeld = SIM_STATE.positions.some(p => p.contract === activeContract && p.strike === r.strike && p.action === r.action);
     if (alreadyHeld) {
       skippedDup++;
+      if (!isHedgeRec) mainLegPlacedOrHeld = true;
+      return;
+    }
+    // Prevent small-capital accounts from skipping Core/Leverage due to cash and ONLY buying the opposite Hedge leg
+    if (isHedgeRec && !mainLegPlacedOrHeld) {
       return;
     }
     const isBuy = r.action === "BC" || r.action === "BP";
-    const reqCash = isBuy ? Math.round(r.price * 50 * r.suggestedLots) : (35000 * r.suggestedLots);
-    if (SIM_STATE.cash >= reqCash) {
-      placeSimOrder(r.strike, r.action, r.suggestedLots, true);
+    const costPerLot = isBuy ? Math.max(500, Math.round(r.price * 50)) : 35000;
+    const maxAffordableLots = Math.floor(SIM_STATE.cash / costPerLot);
+    const execLots = Math.min(r.suggestedLots, maxAffordableLots);
+    if (execLots >= 1) {
+      placeSimOrder(r.strike, r.action, execLots, true);
       placed++;
+      if (!isHedgeRec) mainLegPlacedOrHeld = true;
+    } else {
+      skippedCash++;
     }
   });
   if (placed === 0 && skippedDup > 0) {
     SIM_LAST_AUTO_MSG = `ℹ️ 推薦標的已於持倉中（避免重複疊加歐印），如需加碼請使用下方單筆下單。`;
+  } else if (placed === 0 && skippedCash > 0) {
+    SIM_LAST_AUTO_MSG = `⚠️ 目前可用資金 (NT$ ${fmtNum(SIM_STATE.cash)}) 不足建倉核心推薦標的（請提高本金或選擇較低權利金履約價）。`;
   } else {
-    SIM_LAST_AUTO_MSG = `🤖 已自動依百分比配置建倉 ${placed} 檔週選部位（合約：${TAIFEX_EXPIRE_MONTH || '近週選'}${skippedDup ? `，略過 ${skippedDup} 檔已持倉標的` : ''}）！`;
+    SIM_LAST_AUTO_MSG = `🤖 已自動依百分比配置建倉 ${placed} 檔週選部位（合約：${TAIFEX_EXPIRE_MONTH || '近週選'}${skippedDup ? `，略過 ${skippedDup} 檔已持倉標的` : ''}${skippedCash ? `，${skippedCash} 檔資金不足略過` : ''}）！`;
   }
   renderSimTab();
 }
@@ -2527,22 +2550,28 @@ function checkSimAutoTpSl() {
       pos.peakRoiPct = Math.round(roiPct * 10) / 10;
       peakUpdated = true;
     }
+    let closed = false;
     if (roiPct >= SIM_AUTO_CONFIG.tpPct) {
       toClose.push({ id: pos.id, tag: `🎯 自動停利 (+${roiPct.toFixed(1)}%)` });
+      closed = true;
     } else if (SIM_AUTO_CONFIG.trailingStop && pos.peakRoiPct >= SIM_AUTO_CONFIG.trailingArmPct) {
       const trailFloor = Math.max(0, pos.peakRoiPct - SIM_AUTO_CONFIG.trailingPullbackPct);
       // Only trigger trailing stop-profit when current ROI is STILL profitable (>= 0) and not a flash quote drop!
       if (roiPct <= trailFloor && roiPct >= 0) {
         toClose.push({ id: pos.id, tag: `📈 移動停利 (+${roiPct.toFixed(1)}%, 高點+${pos.peakRoiPct.toFixed(1)}%)` });
+        closed = true;
       }
-    } else if (roiPct <= -SIM_AUTO_CONFIG.slPct) {
-      // Require 2 consecutive ticks confirming stop-loss to prevent 1-tick order-book vacuum false triggers
-      pos.slConfirmCount = (pos.slConfirmCount || 0) + 1;
-      if (pos.slConfirmCount >= 2) {
-        toClose.push({ id: pos.id, tag: `🛡️ 自動停損 (${roiPct.toFixed(1)}%)` });
+    }
+    // Always enforce hard stop-loss (2-tick confirmed) even if position previously hit trailingArmPct and gapped below 0
+    if (!closed) {
+      if (roiPct <= -SIM_AUTO_CONFIG.slPct) {
+        pos.slConfirmCount = (pos.slConfirmCount || 0) + 1;
+        if (pos.slConfirmCount >= 2) {
+          toClose.push({ id: pos.id, tag: `🛡️ 自動停損 (${roiPct.toFixed(1)}%)` });
+        }
+      } else {
+        pos.slConfirmCount = 0;
       }
-    } else {
-      pos.slConfirmCount = 0;
     }
   });
   if (peakUpdated && !toClose.length) saveSimState();
